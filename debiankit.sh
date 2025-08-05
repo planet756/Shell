@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # DebianKit - Debian Environment Setup Tool
-# Version: 1.0.1
+# Version: 1.0.0
 # Author: Planet
 # curl -O https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh
 
@@ -101,7 +101,7 @@ fi
 show_menu() {
     clear
     echo "==============================="
-    echo "       DebianKit v1.0.1        "
+    echo "       DebianKit v1.0.0        "
     echo "==============================="
     echo "i. Initialize User"
     echo "1. Install BBR"
@@ -124,18 +124,17 @@ init_user() {
     
     # Create user if not exists
     if ! id "$username" &>/dev/null; then
+    # 用户不存在 - 创建并设置密码
         useradd --create-home --shell /bin/bash "$username"
-        log "SUCCESS" "User '$username' created"
+        passwd "$username"
     else
+        # 用户已存在
         log "INFO" "User '$username' already exists"
     fi
     
     # Add to groups
     usermod -aG sudo "$username"
     log "SUCCESS" "User '$username' added to sudo groups"
-    
-    # Set password
-    passwd "$username"
     
     # Show user info
     id "$username"
