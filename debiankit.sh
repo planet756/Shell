@@ -98,7 +98,7 @@ show_menu() {
     echo "i. Initialize User"
     echo "1. Install BBR"
     echo "2. Install Docker"
-    echo "2. Install Telegraf"
+    echo "3. Install Telegraf"
     echo "9. Install All"
     echo "0. Exit"
     echo "==============================="
