@@ -3,6 +3,7 @@
 # DebianKit - Debian Environment Setup Tool
 # Version: 1.0.0
 # Author: Planet
+# curl -O https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh
 
 # Logging function
 log() {
@@ -97,6 +98,7 @@ show_menu() {
     echo "i. Initialize User"
     echo "1. Install BBR"
     echo "2. Install Docker"
+    echo "2. Install Telegraf"
     echo "9. Install All"
     echo "0. Exit"
     echo "==============================="
@@ -122,7 +124,7 @@ init_user() {
     
     # Add to groups
     usermod -aG sudo "$username"
-    log "SUCCESS" "User '$username' added to sudo,docker groups"
+    log "SUCCESS" "User '$username' added to sudo groups"
     
     # Set password
     passwd "$username"
