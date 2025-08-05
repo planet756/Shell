@@ -83,11 +83,19 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Update Debian sources on startup
-update_debian_sources
+# Check if this is first run (no backup exists)
+FIRST_RUN=false
+if [[ ! -f /etc/apt/sources.list.backup ]]; then
+    FIRST_RUN=true
+fi
 
-# Install common packages on startup
-install_common_packages
+# Only run initialization on first run
+if $FIRST_RUN; then
+    log "INFO" "First run detected, initializing system..."
+    update_debian_sources
+    install_common_packages
+    echo ""
+fi
 
 # Show menu
 show_menu() {
