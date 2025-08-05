@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # DebianKit - Debian Environment Setup Tool
-# Version: 1.0.0
+# Version: 1.0.1
 # Author: Planet
 # curl -O https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh
 
