@@ -440,9 +440,8 @@ install_komari_agent() {
     
     if su - "$target_user" -c "screen -ls" | grep -q "komari"; then
         log "SUCCESS" "Komari Agent started in screen session"
-        log "INFO" "Reconnect: screen -r komari (or sudo -u komari screen -r komari)"
-        log "INFO" "List sessions: screen -ls"
-        log "INFO" "Detach session: Press Ctrl+A then D"
+        log "INFO" "Reconnect: screen -r komari (or sudo -u komari screen -r komari) - Detach session: Press Ctrl+A then D"
+        log "INFO" "List sessions: screen -ls (or sudo -u komari screen -ls)"
     else
         log "ERROR" "Failed to start screen session"
         return 1
