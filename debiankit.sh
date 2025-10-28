@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # DebianKit - Debian Environment Setup Tool
-# Version: 1.0.0
+# Version: 1.0.1
 # Author: Planet
 # curl -O https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh
 
@@ -101,14 +101,15 @@ fi
 show_menu() {
     clear
     echo "==============================="
-    echo "       DebianKit v1.0.0        "
+    echo "       DebianKit v1.0.1        "
     echo "==============================="
-    echo "i. Initialize User"
-    echo "1. Install BBR"
-    echo "2. Install Docker"
-    echo "3. Install Telegraf"
-    echo "9. Install All"
-    echo "0. Exit"
+    echo "01. Init User"
+    echo "02. Install BBR"
+    echo "03. Install Docker"
+    echo "04. Install Telegraf"
+    echo "05. Install Komari Agent (Non-Root)"
+    echo "99. Install All"
+    echo "00. Exit"
     echo "==============================="
 }
 
@@ -177,6 +178,13 @@ install_bbr() {
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
+      
+      if [ $? -eq 0 ]; then
+        log "SUCCESS" "BBR configuration written to sysctl.conf"
+      else
+          log "ERROR" "Failed to write BBR configuration"
+          return 1
+      fi
     fi
     
     sysctl -p > /dev/null 2>&1
@@ -276,6 +284,11 @@ install_telegraf() {
             # Update and install
             log "INFO" "Installing Telegraf from repository..."
             if apt-get update > /dev/null 2>&1 && apt-get install -y telegraf > /dev/null 2>&1; then
+                # Create log file and set permissions
+                log "INFO" "Creating telegraf.log and setting permissions..."
+                touch /var/log/telegraf/telegraf.log
+                chown telegraf:telegraf /var/log/telegraf/telegraf.log
+
                 # Start service
                 systemctl enable telegraf --now > /dev/null 2>&1
                 log "SUCCESS" "Telegraf installed from official repository"
@@ -299,7 +312,144 @@ install_telegraf() {
     fi
 }
 
+# Install Komari Agent (Non-Root)
+install_komari_agent() {
+    log "INFO" "Installing Komari Agent (Non-Root Mode)..."
+    echo ""
+    
+    local target_user="komari"
+    
+    # Check if komari user exists
+    if id "$target_user" &>/dev/null; then
+        log "INFO" "User 'komari' already exists"
+    else
+        log "INFO" "Creating dedicated 'komari' user (UID 5774)..."
+        
+        # Create komari user with specific UID
+        if useradd --uid 5774 --create-home --shell /bin/bash --comment "Komari Agent Service User" "$target_user" 2>/dev/null; then
+            log "SUCCESS" "User 'komari' created successfully"
+        else
+            # If UID 5774 is taken, create without specific UID
+            if useradd --create-home --shell /bin/bash --comment "Komari Agent Service User" "$target_user" 2>/dev/null; then
+                log "WARN" "User 'komari' created with auto-assigned UID (5774 was not available)"
+            else
+                log "ERROR" "Failed to create 'komari' user"
+                return 1
+            fi
+        fi
 
+        # Set a random password (user won't need to login directly)
+        echo "komari:$(openssl rand -base64 32)" | chpasswd 2>/dev/null
+        log "INFO" "Password set for 'komari' user"
+    fi
+    
+    # Get user home directory
+    target_home=$(eval echo "~$target_user")
+    log "INFO" "Using user: $target_user ($(id -u $target_user):$(id -g $target_user))"
+    log "INFO" "Home directory: $target_home"
+    
+    # Detect architecture
+    log "INFO" "Detecting system architecture..."
+    local arch=$(uname -m)
+    local komari_arch=""
+    
+    case $arch in
+        x86_64|amd64)
+            komari_arch="amd64"
+            ;;
+        i386|i686)
+            komari_arch="386"
+            ;;
+        aarch64|arm64)
+            komari_arch="arm64"
+            ;;
+        armv7l)
+            komari_arch="arm"
+            ;;
+        *)
+            log "ERROR" "Unsupported architecture: $arch"
+            return 1
+            ;;
+    esac
+    
+    log "INFO" "Detected architecture: $arch -> komari-agent-linux-$komari_arch"
+    
+    # Download Komari Agent
+    log "INFO" "Downloading Komari Agent..."
+    local download_url="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${komari_arch}"
+    local target_file="${target_home}/.komari-agent"
+    
+    if su - "$target_user" -c "curl -L -o '$target_file' '$download_url'" 2>/dev/null; then
+        log "SUCCESS" "Download completed"
+    else
+        log "ERROR" "Download failed"
+        return 1
+    fi
+    
+    # Verify file
+    if [[ ! -f "$target_file" ]] || [[ ! -s "$target_file" ]]; then
+        log "ERROR" "Downloaded file is invalid"
+        return 1
+    fi
+    
+    # Set execute permission
+    chmod +x "$target_file"
+    chown "$target_user:$target_user" "$target_file"
+    log "INFO" "File size: $(ls -lh $target_file | awk '{print $5}')"
+    
+    # Get server parameters
+    echo ""
+    log "INFO" "Please provide Komari Agent configuration:"
+    read -p "Server URL (-e): " server_url
+    read -p "Token (-t): " token
+    
+    if [[ -z "$server_url" ]] || [[ -z "$token" ]]; then
+        log "ERROR" "Server URL and Token cannot be empty"
+        return 1
+    fi
+    
+    local run_params="-e $server_url -t $token"
+
+    # Optional parameters
+    echo ""
+    log "INFO" "Optional parameters"
+    read -p "Enter additional parameters (or press Enter to skip): " additional_params
+    if [[ -n "$additional_params" ]]; then
+        run_params="$run_params $additional_params"
+        log "INFO" "Added parameters: $additional_params"
+    fi
+
+    echo ""
+    log "INFO" "Final command: komari-agent $run_params"
+    
+    # Install screen if not available
+    if ! command -v screen &> /dev/null; then
+        log "INFO" "Installing screen..."
+        apt-get update > /dev/null 2>&1
+        apt-get install -y screen > /dev/null 2>&1
+    fi
+    
+    log "INFO" "Setting up screen keepalive..."
+    
+    # Kill existing screen session if exists
+    su - "$target_user" -c "screen -S komari -X quit 2>/dev/null" || true
+    
+    # Start in screen directly
+    su - "$target_user" -c "cd $target_home && screen -dmS komari $target_file $run_params"
+    sleep 2
+    
+    if su - "$target_user" -c "screen -ls" | grep -q "komari"; then
+        log "SUCCESS" "Komari Agent started in screen session"
+        log "INFO" "Reconnect: screen -r komari (or sudo -u komari screen -r komari)"
+        log "INFO" "List sessions: screen -ls"
+        log "INFO" "Detach session: Press Ctrl+A then D"
+    else
+        log "ERROR" "Failed to start screen session"
+        return 1
+    fi
+    
+    return 0
+}
 
 # Install all
 install_all() {
@@ -312,6 +462,8 @@ install_all() {
     echo ""
     install_telegraf
     echo ""
+    install_komari_agent
+    echo ""
     
     log "SUCCESS" "Installation completed!"
 }
@@ -320,22 +472,25 @@ install_all() {
 while true; do
     show_menu
     echo ""
-    read -p "Select option [i/1/2/3/9/0]: " choice
+    read -p "Select option: " choice
     
     case $choice in
-        i|I)
+        01)
             init_user
             ;;
-        1)
+        02)
             install_bbr
             ;;
-        2)
+        03)
             install_docker
             ;;
-        3)
+        04)
             install_telegraf
             ;;
-        9)
+        05)
+            install_komari_agent
+            ;;
+        99)
             install_all
             echo ""
             read -p "Reboot system now? (y/N): " -n 1 -r
@@ -346,7 +501,7 @@ while true; do
                 reboot
             fi
             ;;
-        0)
+        00)
             log "INFO" "Exiting"
             exit 0
             ;;
