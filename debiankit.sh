@@ -432,7 +432,7 @@ install_komari_agent() {
     log "INFO" "Setting up screen keepalive..."
     
     # Kill existing screen session if exists
-    su - "$target_user" -c "screen -S komari -X quit 2>/dev/null" || true
+    su - "$target_user" -c "screen -S komari -X quit 2>/dev/null || true"
     
     # Start in screen directly
     su - "$target_user" -c "cd $target_home && screen -dmS komari $target_file $run_params"
