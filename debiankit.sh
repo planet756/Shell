@@ -393,7 +393,7 @@ install_telegraf() {
     log "INFO" "Verifying GPG key fingerprint..."
     local key_fingerprint=$(gpg --show-keys --with-fingerprint --with-colons ./influxdata-archive.key 2>&1 | grep '^fpr:' | cut -d: -f10)
 
-    if [[ "$key_fingerprint" == "9D539D90D3328DC7D6C8D3B9D8FF8E1F7DF8B07E" ]]; then
+    if [[ "$key_fingerprint" == "24C975CBA61A024EE1B631787C3D57159FC2F927" ]]; then
         log "SUCCESS" "GPG key verified"
     else
         log "WARN" "GPG key fingerprint mismatch, but continuing (fingerprint: $key_fingerprint)"
