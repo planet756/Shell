@@ -3,7 +3,7 @@
 # DebianKit - Debian Environment Setup Tool
 # Version: 1.1.0
 # Author: Planet
-# sudo bash <(curl -sL https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh)
+# curl -sL https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh | sudo bash
 
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
