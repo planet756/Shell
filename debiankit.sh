@@ -3,7 +3,12 @@
 # DebianKit - Debian Environment Setup Tool
 # Version: 1.1.0
 # Author: Planet
-# curl -sL https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh | sudo bash
+# root：
+## bash <(curl -sL https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh)
+# Non root
+## curl -sL https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh -o debiankit.sh
+## chmod +x debiankit.sh
+## sudo ./debiankit.sh
 
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -679,7 +684,7 @@ show_menu() {
     echo "05. Install Telegraf"
     echo "06. Install Komari Agent (Non-Root)"
     echo ""
-    echo "99. Install All (BBR + Docker + Telegraf + Komari)"
+    echo "99. Install All"
     echo "00. Exit"
     echo -e "${BLUE}======================================${NC}"
     echo -e "${YELLOW}Tip: Type 'reset' to reset initialization${NC}"
