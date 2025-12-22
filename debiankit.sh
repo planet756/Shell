@@ -133,11 +133,11 @@ update_debian_sources() {
      
     # Write new sources.list
     cat > /etc/apt/sources.list << 'EOF'
-# Debian Bookworm Sources
-deb http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware
-deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian/ bookworm-updates main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian/ bookworm-backports main contrib non-free non-free-firmware
+# Debian trixie Sources
+deb http://deb.debian.org/debian trixie main non-free-firmware
+deb http://security.debian.org/debian-security trixie-security main non-free-firmware
+deb http://deb.debian.org/debian/ trixie-updates main non-free-firmware
+deb http://deb.debian.org/debian/ trixie-backports main non-free-firmware
 EOF
     
     # Update package list
