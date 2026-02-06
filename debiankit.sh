@@ -453,182 +453,81 @@ EOF
 # Install Komari Agent (Non-Root)
 install_komari_agent() {
     log "INFO" "Installing Komari Agent (Non-Root Mode)..."
-    echo ""
     
     local target_user="komari"
-    local target_uid=5774
+    local target_home="/home/$target_user"
+    local target_file="${target_home}/.komari-agent"
+    local is_update=false
 
-    # Check if komari user exists
     if id "$target_user" &>/dev/null; then
-        log "INFO" "User 'komari' already exists (UID: $(id -u $target_user))"
+        log "INFO" "User '$target_user' exists, skipping creation"
     else
-        log "INFO" "Creating dedicated 'komari' user..."
-        
-        # Try to create with specific UID
-        if useradd --uid $target_uid --create-home --shell /bin/bash --comment "Komari Agent Service User" "$target_user" 2>/dev/null; then
-            log "SUCCESS" "User 'komari' created with UID $target_uid"
-        else
-            # If UID is taken, create without specific UID
-            if useradd --create-home --shell /bin/bash --comment "Komari Agent Service User" "$target_user" 2>/dev/null; then
-                log "WARN" "User 'komari' created with auto-assigned UID (${target_uid} was not available)"
-            else
-                log "ERROR" "Failed to create 'komari' user"
-                return 1
-            fi
-        fi
-
-        # Set a secure random password
-        local random_password=$(openssl rand -base64 32 2>/dev/null || tr -dc A-Za-z0-9 </dev/urandom | head -c 32)
-        echo "${target_user}:${random_password}" | chpasswd 2>/dev/null
-        log "INFO" "Secure password set for 'komari' user"
+        log "INFO" "Creating user '$target_user'..."
+        useradd --uid 5774 --create-home --shell /usr/sbin/nologin "$target_user" 2>/dev/null || \
+        useradd --create-home --shell /usr/sbin/nologin "$target_user" || {
+            log "ERROR" "Failed to create user"; return 1
+        }
+        echo "${target_user}:$(openssl rand -base64 32)" | chpasswd 2>/dev/null
+        log "SUCCESS" "User '$target_user' created"
     fi
-    
-    # Get user home directory
-    local target_home=$(eval echo "~$target_user")
-    log "INFO" "User: $target_user ($(id -u $target_user):$(id -g $target_user))"
-    log "INFO" "Home directory: $target_home"
-    
-    # Detect architecture
-    log "INFO" "Detecting system architecture..."
-    local sys_arch=$(uname -m)
+
+    [[ -f "$target_file" ]] && is_update=true && log "INFO" "Existing agent found, updating..."
+
     local komari_arch=""
-    
-    # Map system architecture to Komari naming convention
-    case $sys_arch in
-        x86_64)  komari_arch="amd64" ;;
+    case $(uname -m) in
+        x86_64)    komari_arch="amd64" ;;
         i386|i686) komari_arch="386" ;;
-        aarch64) komari_arch="arm64" ;;
-        riscv64) komari_arch="riscv64" ;;
-        *)
-            log "ERROR" "Unsupported architecture: $sys_arch"
-            log "INFO" "Supported: x86_64, i386, aarch64, riscv64"
-            return 1
-            ;;
+        aarch64)   komari_arch="arm64" ;;
+        riscv64)   komari_arch="riscv64" ;;
+        *) log "ERROR" "Unsupported architecture: $(uname -m)"; return 1 ;;
     esac
-    
-    log "SUCCESS" "System: $sys_arch -> Komari: komari-linux-$komari_arch"
-    
-    # Download Komari Agent
-    log "INFO" "Downloading Komari Agent..."
+
     local download_url="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-linux-${komari_arch}"
-    local target_dir="${target_home}/.komari"
-    local target_file="${target_dir}/.komari-agent"
-
-    # Create .komari directory if not exists
-    if ! su - "$target_user" -c "mkdir -p '$target_dir'" 2>/dev/null; then
-        log "ERROR" "Failed to create directory: $target_dir"
-        return 1
-    fi
-    log "INFO" "Target directory: $target_dir"
+    log "INFO" "Downloading komari-linux-${komari_arch}..."
     
-    # Remove old binary if exists
-    if [[ -f "$target_file" ]]; then
-        log "INFO" "Removing old Komari Agent binary..."
-        rm -f "$target_file"
-    fi
-    
-    # Download as komari user
-    if su - "$target_user" -c "curl -L -f -o '$target_file' '$download_url'" 2>/dev/null; then
-        log "SUCCESS" "Download completed"
-    else
-        log "ERROR" "Download failed. Please check network connection and try again"
-        return 1
-    fi
-    
-    # Verify downloaded file
-    if [[ ! -f "$target_file" ]]; then
-        log "ERROR" "Downloaded file not found"
-        return 1
-    fi
-
-    if [[ ! -s "$target_file" ]]; then
-        log "ERROR" "Downloaded file is empty"
-        rm -f "$target_file"
-        return 1
-    fi
-    
-    # Set execute permission
+    su - "$target_user" -s /bin/bash -c "curl -sL -f -o '$target_file' '$download_url'" || {
+        log "ERROR" "Download failed"; return 1
+    }
     chmod +x "$target_file"
-    chown "$target_user:$target_user" "$target_file"
-    
-    local file_size=$(ls -lh "$target_file" 2>/dev/null | awk '{print $5}')
-    log "INFO" "Binary size: $file_size"
-    
-    # Get server configuration
+    log "SUCCESS" "Agent downloaded ($(ls -lh "$target_file" | awk '{print $5}'))"
+
+    if $is_update; then
+        if su - "$target_user" -s /bin/bash -c "screen -ls 2>/dev/null" | grep -q "komari"; then
+            su - "$target_user" -s /bin/bash -c "screen -S komari -X quit" 2>/dev/null
+            sleep 1
+            su - "$target_user" -s /bin/bash -c "screen -dmS komari '$target_file'"
+            log "SUCCESS" "Agent updated and restarted"
+        else
+            log "SUCCESS" "Agent updated (not running, start manually)"
+        fi
+        return 0
+    fi
+
     echo ""
-    log "INFO" "Please provide Komari Agent configuration:"
     read -p "Server URL (-e): " server_url
     read -p "Token (-t): " token
-
-    # Validate inputs
-    if [[ -z "$server_url" ]]; then
-        log "ERROR" "Server URL cannot be empty"
-        return 1
-    fi
+    [[ -z "$server_url" || -z "$token" ]] && { log "ERROR" "Server URL and Token required"; return 1; }
     
-    if [[ -z "$token" ]]; then
-        log "ERROR" "Token cannot be empty"
-        return 1
-    fi
-    
-    local run_params="-e ${server_url} -t ${token}"
+    read -p "Additional parameters (optional): " additional_params
+    local run_params="-e ${server_url} -t ${token} ${additional_params}"
 
-    # Optional parameters
-    echo ""
-    log "INFO" "Optional parameters (press Enter to skip):"
-    read -p "Additional parameters: " additional_params
-    if [[ -n "$additional_params" ]]; then
-        run_params="${run_params} ${additional_params}"
-        log "INFO" "Added parameters: $additional_params"
-    fi
+    command -v screen &>/dev/null || {
+        apt-get update -qq && apt-get install -y -qq screen || { log "ERROR" "Failed to install screen"; return 1; }
+    }
 
-    echo ""
-    log "INFO" "Final command: .komari-agent $run_params"
+    su - "$target_user" -s /bin/bash -c "screen -S komari -X quit" 2>/dev/null
+    su - "$target_user" -s /bin/bash -c "screen -dmS komari '$target_file' $run_params" || {
+        log "ERROR" "Failed to start agent"; return 1
+    }
     
-    # Install screen if not available
-    if ! command -v screen &> /dev/null; then
-        log "INFO" "Installing screen for session management..."
-        apt-get update > /dev/null 2>&1
-        if apt-get install -y screen > /dev/null 2>&1; then
-            log "SUCCESS" "Screen installed"
-        else
-            log "ERROR" "Failed to install screen"
-            return 1
-        fi
-    fi
-
-    # Stop existing screen session if exists
-    log "INFO" "Checking for existing Komari Agent sessions..."
-    if su - "$target_user" -c "screen -ls" 2>/dev/null | grep -q "komari"; then
-        log "INFO" "Stopping existing session..."
-        su - "$target_user" -c "screen -S komari -X quit" >/dev/null 2>&1 || true
-        sleep 1
-    fi
-    
-    # Start Komari Agent in screen session
-    log "INFO" "Starting Komari Agent in screen session..."
-    if su - "$target_user" -c "cd '$target_dir' && screen -dmS komari ./.komari-agent $run_params"; then
-        sleep 2
-        
-        # Verify session started
-        if su - "$target_user" -c "screen -ls" 2>/dev/null | grep -q "komari"; then
-            log "SUCCESS" "Komari Agent started successfully in screen session"
-            echo ""
-            log "INFO" "Session Management Commands:"
-            log "INFO" "  - Attach session: sudo -u komari screen -r komari"
-            log "INFO" "  - Detach session: Press Ctrl+A then D"
-            log "INFO" "  - List sessions: sudo -u komari screen -ls"
-            log "INFO" "  - Stop agent: sudo -u komari screen -S komari -X quit"
-        else
-            log "ERROR" "Screen session not found after start"
-            return 1
-        fi
+    sleep 1
+    if su - "$target_user" -s /bin/bash -c "screen -ls" 2>/dev/null | grep -q "komari"; then
+        log "SUCCESS" "Komari Agent started"
+        echo ""
+        log "INFO" "Commands: attach=sudo -u komari screen -r komari | stop=sudo -u komari screen -S komari -X quit"
     else
-        log "ERROR" "Failed to start Komari Agent"
-        return 1
+        log "ERROR" "Agent failed to start"; return 1
     fi
-    
-    return 0
 }
 
 # Install all components
