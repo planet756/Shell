@@ -456,7 +456,9 @@ install_komari_agent() {
     
     local target_user="komari"
     local target_home="/home/$target_user"
-    local target_file="${target_home}/.komari-agent"
+    local target_dir="${target_home}/.komari"
+    local target_file="${target_dir}/komari-agent"
+    local config_file="${target_dir}/komari-agent.conf"
     local is_update=false
 
     if id "$target_user" &>/dev/null; then
@@ -471,7 +473,26 @@ install_komari_agent() {
         log "SUCCESS" "User '$target_user' created"
     fi
 
+    if [[ ! -d "$target_dir" ]]; then
+        mkdir -p "$target_dir"
+        chown "$target_user:$target_user" "$target_dir"
+    fi
+
+    if [[ -f "${target_home}/net_static.json" && ! -f "${target_dir}/net_static.json" ]]; then
+        log "INFO" "Migrating traffic data to .komari directory..."
+        mv "${target_home}/net_static.json" "${target_dir}/net_static.json"
+        chown "$target_user:$target_user" "${target_dir}/net_static.json"
+    fi
+
     [[ -f "$target_file" ]] && is_update=true && log "INFO" "Existing agent found, updating..."
+
+    if $is_update && sudo -u "$target_user" screen -ls 2>/dev/null | grep -q "komari"; then
+        log "INFO" "Stopping running agent (waiting for data flush)..."
+        sudo -u "$target_user" screen -S komari -p 0 -X stuff $'\003'
+        sleep 3
+        sudo -u "$target_user" screen -S komari -X quit 2>/dev/null
+        sleep 1
+    fi
 
     local komari_arch=""
     case $(uname -m) in
@@ -485,21 +506,42 @@ install_komari_agent() {
     local download_url="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${komari_arch}"
     log "INFO" "Downloading komari-agent-linux-${komari_arch}..."
     
-    su - "$target_user" -s /bin/bash -c "curl -sL -f -o '$target_file' '$download_url'" || {
+    rm -f "$target_file"
+    curl -sL -f -o "$target_file" "$download_url" || {
         log "ERROR" "Download failed"; return 1
     }
+    chown "$target_user:$target_user" "$target_file"
     chmod +x "$target_file"
     log "SUCCESS" "Agent downloaded ($(ls -lh "$target_file" | awk '{print $5}'))"
 
     if $is_update; then
-        if su - "$target_user" -s /bin/bash -c "screen -ls 2>/dev/null" | grep -q "komari"; then
-            su - "$target_user" -s /bin/bash -c "screen -S komari -X quit" 2>/dev/null
-            sleep 1
-            su - "$target_user" -s /bin/bash -c "screen -dmS komari '$target_file'"
-            log "SUCCESS" "Agent updated and restarted"
+        local run_params=""
+        local update_config="n"
+        
+        echo ""
+        read -p "Update configuration? [y/N]: " update_config
+        
+        if [[ "${update_config,,}" == "y" ]]; then
+            read -p "Server URL (-e): " server_url
+            read -p "Token (-t): " token
+            [[ -z "$server_url" || -z "$token" ]] && { log "ERROR" "Server URL and Token required"; return 1; }
+            read -p "Additional parameters (optional): " additional_params
+            run_params="-e ${server_url} -t ${token} ${additional_params}"
+            echo "$run_params" > "$config_file"
+            chown "$target_user:$target_user" "$config_file"
+            chmod 600 "$config_file"
+            rm -f "${target_dir}/net_static.json"
+            log "SUCCESS" "Configuration updated, traffic statistics reset"
+        elif [[ -f "$config_file" ]]; then
+            run_params=$(cat "$config_file")
+            log "INFO" "Using saved configuration"
         else
-            log "SUCCESS" "Agent updated (not running, start manually)"
+            log "WARN" "No config found, start manually with parameters"
+            return 0
         fi
+        
+        sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $run_params"
+        log "SUCCESS" "Agent updated and restarted"
         return 0
     fi
 
@@ -511,17 +553,21 @@ install_komari_agent() {
     read -p "Additional parameters (optional): " additional_params
     local run_params="-e ${server_url} -t ${token} ${additional_params}"
 
+    echo "$run_params" > "$config_file"
+    chown "$target_user:$target_user" "$config_file"
+    chmod 600 "$config_file"
+
     command -v screen &>/dev/null || {
         apt-get update -qq && apt-get install -y -qq screen || { log "ERROR" "Failed to install screen"; return 1; }
     }
 
-    su - "$target_user" -s /bin/bash -c "screen -S komari -X quit" 2>/dev/null
-    su - "$target_user" -s /bin/bash -c "screen -dmS komari '$target_file' $run_params" || {
+    sudo -u "$target_user" screen -S komari -X quit 2>/dev/null
+    sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $run_params" || {
         log "ERROR" "Failed to start agent"; return 1
     }
     
     sleep 1
-    if su - "$target_user" -s /bin/bash -c "screen -ls" 2>/dev/null | grep -q "komari"; then
+    if sudo -u "$target_user" screen -ls 2>/dev/null | grep -q "komari"; then
         log "SUCCESS" "Komari Agent started"
         echo ""
         log "INFO" "Commands: attach=sudo -u komari screen -r komari | stop=sudo -u komari screen -S komari -X quit"
