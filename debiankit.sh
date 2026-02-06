@@ -530,8 +530,14 @@ install_komari_agent() {
             echo "$run_params" > "$config_file"
             chown "$target_user:$target_user" "$config_file"
             chmod 600 "$config_file"
-            rm -f "${target_dir}/net_static.json"
-            log "SUCCESS" "Configuration updated, traffic statistics reset"
+            log "SUCCESS" "Configuration updated"
+            
+            local reset_traffic="n"
+            read -p "Reset traffic statistics? [y/N]: " reset_traffic
+            if [[ "${reset_traffic,,}" == "y" ]]; then
+                rm -f "${target_dir}/net_static.json"
+                log "INFO" "Traffic statistics reset"
+            fi
         elif [[ -f "$config_file" ]]; then
             run_params=$(cat "$config_file")
             log "INFO" "Using saved configuration"
