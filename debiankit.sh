@@ -482,8 +482,8 @@ install_komari_agent() {
         *) log "ERROR" "Unsupported architecture: $(uname -m)"; return 1 ;;
     esac
 
-    local download_url="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-linux-${komari_arch}"
-    log "INFO" "Downloading komari-linux-${komari_arch}..."
+    local download_url="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${komari_arch}"
+    log "INFO" "Downloading komari-agent-linux-${komari_arch}..."
     
     su - "$target_user" -s /bin/bash -c "curl -sL -f -o '$target_file' '$download_url'" || {
         log "ERROR" "Download failed"; return 1
