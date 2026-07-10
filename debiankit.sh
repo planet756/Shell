@@ -3,7 +3,7 @@
 # DebianKit - Debian Environment Setup Tool
 # Version: 1.2.0
 # Author: Planet
-# curl -fsSL https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh | sudo bash
+# sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh)"
 
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -866,7 +866,11 @@ main() {
     while true; do
         show_menu
         echo ""
-        read -p "Select option [00-99]: " choice
+        if ! read -r -p "Select option [00-99]: " choice; then
+            echo ""
+            log "ERROR" "Interactive input is unavailable. Do not pipe this script directly to bash."
+            exit 1
+        fi
         echo ""
 
         case $choice in
