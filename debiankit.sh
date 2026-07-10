@@ -383,7 +383,12 @@ install_nodejs() {
 
     if [[ -z "$node_version" ]]; then
         log "INFO" "Detecting latest Node.js LTS version..."
-        if ! release_index=$(curl -fsSL https://nodejs.org/dist/index.json); then
+        if ! release_index=$(curl -fsSL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            https://nodejs.org/dist/index.json); then
             log "ERROR" "Failed to retrieve Node.js release information"
             return 1
         fi
@@ -442,26 +447,41 @@ install_nodejs() {
             return 1
         }
 
-        log "INFO" "Downloading Node.js $node_version for linux-$node_arch..."
-        if ! curl -fL --retry 3 \
-            "https://nodejs.org/dist/${node_version}/${archive_name}" \
-            -o "${temp_dir}/${archive_name}"; then
-            log "ERROR" "Failed to download Node.js binary"
-            rm -rf "$temp_dir"
-            return 1
-        fi
-
+        log "INFO" "Downloading Node.js checksums..."
         if ! curl -fsSL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            --connect-timeout 15 \
             "https://nodejs.org/dist/${node_version}/SHASUMS256.txt" \
             -o "${temp_dir}/SHASUMS256.txt"; then
-            log "ERROR" "Failed to download Node.js checksums"
+            log "ERROR" "Failed to download Node.js checksums after retries"
             rm -rf "$temp_dir"
             return 1
         fi
 
         expected_checksum=$(awk -v archive="$archive_name" '$2 == archive { print $1 }' "${temp_dir}/SHASUMS256.txt")
+        if [[ -z "$expected_checksum" ]]; then
+            log "ERROR" "Node.js binary is not listed in the official checksums: $archive_name"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+
+        log "INFO" "Downloading Node.js $node_version for linux-$node_arch..."
+        if ! curl -fsSL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            "https://nodejs.org/dist/${node_version}/${archive_name}" \
+            -o "${temp_dir}/${archive_name}"; then
+            log "ERROR" "Failed to download Node.js binary after retries"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+
         actual_checksum=$(sha256sum "${temp_dir}/${archive_name}" | awk '{ print $1 }')
-        if [[ -z "$expected_checksum" || "$actual_checksum" != "$expected_checksum" ]]; then
+        if [[ "$actual_checksum" != "$expected_checksum" ]]; then
             log "ERROR" "Node.js checksum verification failed"
             rm -rf "$temp_dir"
             return 1
