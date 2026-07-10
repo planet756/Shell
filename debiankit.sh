@@ -570,7 +570,7 @@ install_nodejs() {
         fi
 
         log "SUCCESS" "npm global prefix configured for user '$target_user': $target_home/.local"
-        log "INFO" "User '$target_user' should log in again to apply the PATH change"
+        log "INFO" "If npm commands are not found, run 'source ~/.profile'"
     fi
 
     if [[ -x /usr/local/bin/node && -x /usr/local/bin/npm ]]; then
@@ -590,7 +590,9 @@ install_nodejs() {
             return 1
         fi
 
-        log "SUCCESS" "Node.js installed successfully ($installed_node_version, npm $installed_npm_version)"
+        log "SUCCESS" "Node.js installation verified"
+        log "INFO" "Node.js version: $installed_node_version"
+        log "INFO" "npm version: $installed_npm_version"
         return 0
     fi
 
