@@ -21,7 +21,7 @@ log() {
     local level="$1"
     local message="$2"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
+
     case "$level" in
         "INFO")
             echo -e "${BLUE}[$timestamp]${NC} [INFO] $message"
@@ -57,28 +57,28 @@ check_root() {
 # Install common packages
 install_common_packages() {
     log "INFO" "Checking common packages..."
-    
+
     local packages_to_install=()
     local common_packages=("ca-certificates" "curl" "vim" "sudo" "gnupg")
-    
+
     # Check each package
     for pkg in "${common_packages[@]}"; do
         if ! dpkg -l 2>/dev/null | grep -q "^ii  $pkg "; then
             packages_to_install+=("$pkg")
         fi
     done
-    
+
     # Install missing packages
     if [[ ${#packages_to_install[@]} -gt 0 ]]; then
         log "INFO" "Installing missing packages: ${packages_to_install[*]}"
-        
+
         # Update package list
         apt-get update > /dev/null 2>&1
-        
+
         # Install packages with retry logic
         local max_retries=3
         local retry_count=0
-        
+
         while [[ $retry_count -lt $max_retries ]]; do
             if apt-get install -y "${packages_to_install[@]}" > /dev/null 2>&1; then
                 log "SUCCESS" "Missing packages installed successfully"
@@ -91,7 +91,7 @@ install_common_packages() {
                 fi
             fi
         done
-        
+
         log "ERROR" "Failed to install missing packages after $max_retries attempts"
         return 1
     else
@@ -103,11 +103,11 @@ install_common_packages() {
 # Initialize system on first run
 initialize_system() {
     local init_marker="/var/lib/debiankit/.initialized"
-    
+
     # Check if this is first run
     if [[ ! -f "$init_marker" ]]; then
         log "INFO" "First run detected, installing essential packages..."
-        
+
         # Only install common packages, do NOT update sources automatically
         if install_common_packages; then
             # Create marker directory and file
@@ -124,13 +124,13 @@ initialize_system() {
 # Update Debian sources
 update_debian_sources() {
     log "INFO" "Updating Debian sources..."
-    
+
     # Backup original sources.list
     if [[ -f /etc/apt/sources.list ]]; then
         cp /etc/apt/sources.list /etc/apt/sources.list.backup
         log "INFO" "Original sources.list backed up to sources.list.backup"
     fi
-     
+
     # Write new sources.list
     cat > /etc/apt/sources.list << 'EOF'
 # Debian trixie Sources
@@ -139,7 +139,7 @@ deb http://security.debian.org/debian-security trixie-security main non-free-fir
 deb http://deb.debian.org/debian/ trixie-updates main non-free-firmware
 deb http://deb.debian.org/debian/ trixie-backports main non-free-firmware
 EOF
-    
+
     # Update package list
     if apt-get update > /dev/null 2>&1; then
         log "SUCCESS" "Debian sources updated successfully"
@@ -153,26 +153,26 @@ EOF
 # Initialize user
 init_user() {
     log "INFO" "Initialize user setup..."
-    
+
     # Get username
     read -p "Enter username: " username
     if [[ -z "$username" ]]; then
         log "ERROR" "Username cannot be empty"
         return 1
     fi
-    
+
     # Validate username format
     if ! [[ "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
         log "ERROR" "Invalid username format. Use lowercase letters, numbers, underscore, and hyphen only"
         return 1
     fi
-    
+
     # Create user if not exists
     if ! id "$username" &>/dev/null; then
         log "INFO" "Creating user '$username'..."
         if useradd --create-home --shell /bin/bash "$username"; then
             log "SUCCESS" "User '$username' created"
-            
+
             # Set password
             log "INFO" "Please set password for user '$username':"
             if passwd "$username"; then
@@ -188,26 +188,26 @@ init_user() {
     else
         log "INFO" "User '$username' already exists"
     fi
-    
+
     # Add to sudo group
     if usermod -aG sudo "$username" 2>/dev/null; then
         log "SUCCESS" "User '$username' added to sudo group"
     else
         log "WARN" "Failed to add user to sudo group (may already be a member)"
     fi
-    
+
     # Show user info
     echo ""
     log "INFO" "User information:"
     id "$username"
-    
+
     return 0
 }
 
 # Install BBR
 install_bbr() {
     log "INFO" "Installing BBR (TCP Congestion Control)..."
-    
+
     # Check if already enabled
     local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
     if [[ "$current_cc" == "bbr" ]]; then
@@ -215,19 +215,19 @@ install_bbr() {
         sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null || true
         return 0
     fi
-    
+
     # Check kernel version
     local kernel_version=$(uname -r | cut -d. -f1-2)
     local kernel_major=$(echo "$kernel_version" | cut -d. -f1)
     local kernel_minor=$(echo "$kernel_version" | cut -d. -f2)
-    
+
     log "INFO" "Current kernel version: $(uname -r)"
-    
+
     if [[ $kernel_major -lt 4 ]] || [[ $kernel_major -eq 4 && $kernel_minor -lt 9 ]]; then
         log "ERROR" "Kernel $(uname -r) does not support BBR (requires 4.9+)"
         return 1
     fi
-    
+
     # Load BBR module
     log "INFO" "Loading tcp_bbr module..."
     if modprobe tcp_bbr 2>/dev/null; then
@@ -236,13 +236,13 @@ install_bbr() {
         log "ERROR" "Failed to load tcp_bbr module"
         return 1
     fi
-    
+
     # Ensure module loads on boot
     if ! grep -q "^tcp_bbr$" /etc/modules 2>/dev/null; then
         echo "tcp_bbr" >> /etc/modules
         log "INFO" "Added tcp_bbr to /etc/modules"
     fi
-    
+
     # Configure sysctl
     if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
         log "INFO" "Configuring sysctl settings..."
@@ -256,14 +256,14 @@ EOF
     else
         log "INFO" "BBR configuration already exists in /etc/sysctl.conf"
     fi
-    
+
     # Apply settings
     if sysctl -p > /dev/null 2>&1; then
         log "SUCCESS" "Sysctl settings applied"
     else
         log "WARN" "Failed to apply some sysctl settings"
     fi
-    
+
     # Verify installation
     sleep 1
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
@@ -281,17 +281,17 @@ EOF
 # Install Docker
 install_docker() {
     log "INFO" "Installing Docker..."
-    
+
     # Check if already installed
     if command -v docker &> /dev/null; then
         local docker_version=$(docker --version 2>/dev/null | cut -d' ' -f3 | cut -d',' -f1)
         log "SUCCESS" "Docker is already installed (version: $docker_version)"
         return 0
     fi
-    
+
     # Create keyrings directory
     install -m 0755 -d /etc/apt/keyrings
-    
+
     # Add Docker GPG key
     log "INFO" "Adding Docker GPG key..."
     if curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc 2>/dev/null; then
@@ -301,7 +301,7 @@ install_docker() {
         log "ERROR" "Failed to download Docker GPG key"
         return 1
     fi
-    
+
     # Add Docker repository using DEB822 format
     log "INFO" "Adding Docker repository..."
     local debian_version=$(. /etc/os-release && echo "$VERSION_CODENAME")
@@ -312,14 +312,14 @@ Suites: $debian_version
 Components: stable
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
-    
+
     # Update package list
     log "INFO" "Updating package list..."
     apt-get update > /dev/null 2>&1 || {
         log "ERROR" "Failed to update package list"
         return 1
     }
-    
+
     # Install Docker packages
     log "INFO" "Installing Docker packages (this may take a few minutes)..."
     if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin > /dev/null 2>&1; then
@@ -328,7 +328,7 @@ EOF
         log "ERROR" "Failed to install Docker packages"
         return 1
     fi
-    
+
     # Start and enable Docker service
     log "INFO" "Starting Docker service..."
     systemctl enable docker --now > /dev/null 2>&1 || {
@@ -348,7 +348,7 @@ EOF
         log "ERROR" "Docker installation verification failed"
         return 1
     fi
-    
+
     # Ask about adding user to docker group
     echo ""
     read -p "Add a user to docker group? Enter username (or press Enter to skip): " docker_user
@@ -496,24 +496,6 @@ install_nodejs() {
         log "SUCCESS" "Node.js $node_version installed to $install_prefix"
     fi
 
-    local command_name
-    local command_target
-    local link_target
-    for command_name in node npm npx corepack; do
-        command_target="$install_prefix/bin/$command_name"
-        if [[ -L "$command_target" ]]; then
-            link_target=$(readlink "$command_target")
-            if [[ "$link_target" == /opt/nodejs/* ]]; then
-                rm -f "$command_target"
-            fi
-        fi
-    done
-
-    if [[ -L /opt/nodejs/current ]]; then
-        rm -rf /opt/nodejs
-        log "INFO" "Removed legacy Node.js installation from /opt/nodejs"
-    fi
-
     local default_user=""
     local target_user
     local target_home
@@ -552,7 +534,8 @@ install_nodejs() {
         if ! sudo -u "$target_user" env \
             HOME="$target_home" \
             PATH="/usr/local/bin:/usr/bin:/bin" \
-            /usr/local/bin/npm config set prefix "$target_home/.local"; then
+            /bin/sh -c 'cd / && exec /usr/local/bin/npm config set prefix "$1" --location=user' \
+            sh "$target_home/.local"; then
             log "ERROR" "Failed to configure npm prefix for user '$target_user'"
             return 1
         fi
@@ -578,8 +561,20 @@ install_nodejs() {
     if [[ -x /usr/local/bin/node && -x /usr/local/bin/npm ]]; then
         local installed_node_version
         local installed_npm_version
-        installed_node_version=$(/usr/local/bin/node --version)
-        installed_npm_version=$(PATH="/usr/local/bin:/usr/bin:/bin" /usr/local/bin/npm --version)
+
+        if ! installed_node_version=$(/usr/local/bin/node --version); then
+            log "ERROR" "Failed to verify Node.js version"
+            return 1
+        fi
+
+        if ! installed_npm_version=$(cd / && \
+            NPM_CONFIG_USERCONFIG=/dev/null \
+            PATH="/usr/local/bin:/usr/bin:/bin" \
+            /usr/local/bin/npm --version); then
+            log "ERROR" "Failed to verify npm version"
+            return 1
+        fi
+
         log "SUCCESS" "Node.js installed successfully ($installed_node_version, npm $installed_npm_version)"
         return 0
     fi
@@ -591,14 +586,14 @@ install_nodejs() {
 # Install Telegraf
 install_telegraf() {
     log "INFO" "Installing Telegraf..."
-    
+
     # Check if already installed
     if command -v telegraf &> /dev/null; then
         local telegraf_version=$(telegraf version 2>/dev/null | head -n1 || echo "unknown")
         log "SUCCESS" "Telegraf is already installed ($telegraf_version)"
         return 0
     fi
-    
+
     # Download and verify InfluxData GPG key
     log "INFO" "Adding InfluxData repository..."
     cd /tmp || error_exit "Failed to change to /tmp directory"
@@ -642,16 +637,16 @@ EOF
     if apt-get update > /dev/null 2>&1 && apt-get install -y telegraf > /dev/null 2>&1; then
         # Create log directory if not exists
         mkdir -p /var/log/telegraf
-        
+
         # Create log file and set permissions
         log "INFO" "Configuring Telegraf logging..."
         touch /var/log/telegraf/telegraf.log
         chown telegraf:telegraf /var/log/telegraf/telegraf.log
         chown telegraf:telegraf /var/log/telegraf
-        
+
         # Start service
         systemctl enable telegraf --now > /dev/null 2>&1
-        
+
         # Verify service status
         if systemctl is-active --quiet telegraf; then
             log "SUCCESS" "Telegraf installed and service is running"
@@ -659,7 +654,7 @@ EOF
         else
             log "WARN" "Telegraf installed but service is not running"
         fi
-        
+
         # Cleanup
         rm -f /tmp/influxdata-archive.key
         return 0
@@ -673,7 +668,7 @@ EOF
 # Install Komari Agent (Non-Root)
 install_komari_agent() {
     log "INFO" "Installing Komari Agent (Non-Root Mode)..."
-    
+
     local target_user="komari"
     local target_home="/home/$target_user"
     local target_dir="${target_home}/.komari"
@@ -725,7 +720,7 @@ install_komari_agent() {
 
     local download_url="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${komari_arch}"
     log "INFO" "Downloading komari-agent-linux-${komari_arch}..."
-    
+
     rm -f "$target_file"
     curl -sL -f -o "$target_file" "$download_url" || {
         log "ERROR" "Download failed"; return 1
@@ -737,10 +732,10 @@ install_komari_agent() {
     if $is_update; then
         local run_params=""
         local update_config="n"
-        
+
         echo ""
         read -p "Update configuration? [y/N]: " update_config
-        
+
         if [[ "${update_config,,}" == "y" ]]; then
             read -p "Server URL (-e): " server_url
             read -p "Token (-t): " token
@@ -751,7 +746,7 @@ install_komari_agent() {
             chown "$target_user:$target_user" "$config_file"
             chmod 600 "$config_file"
             log "SUCCESS" "Configuration updated"
-            
+
             local reset_traffic="n"
             read -p "Reset traffic statistics? [y/N]: " reset_traffic
             if [[ "${reset_traffic,,}" == "y" ]]; then
@@ -765,7 +760,7 @@ install_komari_agent() {
             log "WARN" "No config found, start manually with parameters"
             return 0
         fi
-        
+
         sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $run_params"
         log "SUCCESS" "Agent updated and restarted"
         return 0
@@ -775,7 +770,7 @@ install_komari_agent() {
     read -p "Server URL (-e): " server_url
     read -p "Token (-t): " token
     [[ -z "$server_url" || -z "$token" ]] && { log "ERROR" "Server URL and Token required"; return 1; }
-    
+
     read -p "Additional parameters (optional): " additional_params
     local run_params="-e ${server_url} -t ${token} ${additional_params}"
 
@@ -791,7 +786,7 @@ install_komari_agent() {
     sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $run_params" || {
         log "ERROR" "Failed to start agent"; return 1
     }
-    
+
     sleep 1
     if sudo -u "$target_user" screen -ls 2>/dev/null | grep -q "komari"; then
         log "SUCCESS" "Komari Agent started"
@@ -806,18 +801,18 @@ install_komari_agent() {
 install_all() {
     log "INFO" "Starting full installation..."
     echo ""
-    
+
     local failed_components=()
-    
+
     # Install each component
     echo -e "${BLUE}=== Installing BBR ===${NC}"
     install_bbr || failed_components+=("BBR")
     echo ""
-    
+
     echo -e "${BLUE}=== Installing Docker ===${NC}"
     install_docker || failed_components+=("Docker")
     echo ""
-    
+
     echo -e "${BLUE}=== Installing Node.js ===${NC}"
     install_nodejs || failed_components+=("Node.js")
     echo ""
@@ -825,11 +820,11 @@ install_all() {
     echo -e "${BLUE}=== Installing Telegraf ===${NC}"
     install_telegraf || failed_components+=("Telegraf")
     echo ""
-    
+
     echo -e "${BLUE}=== Installing Komari Agent ===${NC}"
     install_komari_agent || failed_components+=("Komari Agent")
     echo ""
-    
+
     # Summary
     echo -e "${BLUE}======================================${NC}"
     if [[ ${#failed_components[@]} -eq 0 ]]; then
@@ -871,14 +866,14 @@ show_menu() {
 main() {
     check_root
     initialize_system
-    
+
     # Main loop
     while true; do
         show_menu
         echo ""
         read -p "Select option [00-99]: " choice
         echo ""
-        
+
         case $choice in
             01)
                 update_debian_sources
@@ -928,7 +923,7 @@ main() {
                 log "ERROR" "Invalid option: $choice"
                 ;;
         esac
-        
+
         pause
     done
 }
