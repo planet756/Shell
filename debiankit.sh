@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # DebianKit - Debian Environment Setup Tool
-# Version: 1.1.0
+# Version: 1.2.0
 # Author: Planet
 # root：
 ## bash <(curl -sL https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh)
@@ -368,6 +368,226 @@ EOF
     return 0
 }
 
+# Install Node.js from official binary
+install_nodejs() {
+    log "INFO" "Installing Node.js from official binary..."
+
+    local node_version
+    local node_arch
+    local archive_name
+    local archive_dir
+    local install_prefix="/usr/local"
+    local current_version=""
+    local temp_dir
+    local release_index
+    local release_line
+    local expected_checksum
+    local actual_checksum
+
+    read -p "Enter Node.js version (e.g. 22.17.0, press Enter for latest LTS): " node_version
+
+    if [[ -z "$node_version" ]]; then
+        log "INFO" "Detecting latest Node.js LTS version..."
+        if ! release_index=$(curl -fsSL https://nodejs.org/dist/index.json); then
+            log "ERROR" "Failed to retrieve Node.js release information"
+            return 1
+        fi
+
+        release_line=$(printf '%s\n' "$release_index" | grep -m1 -E '"lts"[[:space:]]*:[[:space:]]*"[^"]+"')
+        node_version=$(printf '%s\n' "$release_line" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        if [[ -z "$node_version" ]]; then
+            log "ERROR" "Failed to detect the latest Node.js LTS version"
+            return 1
+        fi
+    fi
+
+    node_version="${node_version#v}"
+    if ! [[ "$node_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log "ERROR" "Invalid Node.js version: $node_version"
+        return 1
+    fi
+    node_version="v$node_version"
+
+    case "$(uname -m)" in
+        x86_64|amd64)
+            node_arch="x64"
+            ;;
+        aarch64|arm64)
+            node_arch="arm64"
+            ;;
+        armv7l)
+            node_arch="armv7l"
+            ;;
+        *)
+            log "ERROR" "Unsupported architecture: $(uname -m)"
+            return 1
+            ;;
+    esac
+
+    archive_name="node-${node_version}-linux-${node_arch}.tar.xz"
+    archive_dir="${archive_name%.tar.xz}"
+
+    if [[ -x "$install_prefix/bin/node" && ! -L "$install_prefix/bin/node" ]]; then
+        current_version=$("$install_prefix/bin/node" --version 2>/dev/null || true)
+    fi
+
+    if [[ "$current_version" == "$node_version" && -x "$install_prefix/bin/npm" ]]; then
+        log "INFO" "Node.js $node_version is already installed in $install_prefix"
+    else
+        if ! command -v xz &> /dev/null; then
+            log "INFO" "Installing xz-utils..."
+            if ! apt-get update > /dev/null 2>&1 || ! apt-get install -y xz-utils > /dev/null 2>&1; then
+                log "ERROR" "Failed to install xz-utils"
+                return 1
+            fi
+        fi
+
+        temp_dir=$(mktemp -d) || {
+            log "ERROR" "Failed to create temporary directory"
+            return 1
+        }
+
+        log "INFO" "Downloading Node.js $node_version for linux-$node_arch..."
+        if ! curl -fL --retry 3 \
+            "https://nodejs.org/dist/${node_version}/${archive_name}" \
+            -o "${temp_dir}/${archive_name}"; then
+            log "ERROR" "Failed to download Node.js binary"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+
+        if ! curl -fsSL \
+            "https://nodejs.org/dist/${node_version}/SHASUMS256.txt" \
+            -o "${temp_dir}/SHASUMS256.txt"; then
+            log "ERROR" "Failed to download Node.js checksums"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+
+        expected_checksum=$(awk -v archive="$archive_name" '$2 == archive { print $1 }' "${temp_dir}/SHASUMS256.txt")
+        actual_checksum=$(sha256sum "${temp_dir}/${archive_name}" | awk '{ print $1 }')
+        if [[ -z "$expected_checksum" || "$actual_checksum" != "$expected_checksum" ]]; then
+            log "ERROR" "Node.js checksum verification failed"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+        log "SUCCESS" "Node.js checksum verified"
+
+        mkdir -p \
+            "$install_prefix/bin" \
+            "$install_prefix/lib" \
+            "$install_prefix/include" \
+            "$install_prefix/share"
+
+        if ! tar -xJf "${temp_dir}/${archive_name}" \
+            --no-same-owner \
+            --strip-components=1 \
+            -C "$install_prefix" \
+            "${archive_dir}/bin" \
+            "${archive_dir}/lib" \
+            "${archive_dir}/include" \
+            "${archive_dir}/share"; then
+            log "ERROR" "Failed to install Node.js to $install_prefix"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+
+        rm -rf "$temp_dir"
+        log "SUCCESS" "Node.js $node_version installed to $install_prefix"
+    fi
+
+    local command_name
+    local command_target
+    local link_target
+    for command_name in node npm npx corepack; do
+        command_target="$install_prefix/bin/$command_name"
+        if [[ -L "$command_target" ]]; then
+            link_target=$(readlink "$command_target")
+            if [[ "$link_target" == /opt/nodejs/* ]]; then
+                rm -f "$command_target"
+            fi
+        fi
+    done
+
+    if [[ -L /opt/nodejs/current ]]; then
+        rm -rf /opt/nodejs
+        log "INFO" "Removed legacy Node.js installation from /opt/nodejs"
+    fi
+
+    local default_user=""
+    local target_user
+    local target_home
+    local target_group
+    local profile_file
+
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] && id "$SUDO_USER" &> /dev/null; then
+        default_user="$SUDO_USER"
+        read -p "Configure npm for user [$default_user] (enter 'skip' to skip): " target_user
+        target_user="${target_user:-$default_user}"
+    else
+        read -p "Enter username to configure npm (press Enter to skip): " target_user
+    fi
+
+    if [[ -z "$target_user" || "${target_user,,}" == "skip" ]]; then
+        log "INFO" "Skipped per-user npm configuration"
+    else
+        if [[ "$target_user" == "root" ]]; then
+            log "ERROR" "npm user configuration must use a non-root user"
+            return 1
+        fi
+        if ! id "$target_user" &> /dev/null; then
+            log "ERROR" "User '$target_user' does not exist"
+            return 1
+        fi
+
+        target_home=$(getent passwd "$target_user" | cut -d: -f6)
+        target_group=$(id -gn "$target_user")
+        if [[ -z "$target_home" || ! -d "$target_home" ]]; then
+            log "ERROR" "Home directory for user '$target_user' does not exist"
+            return 1
+        fi
+
+        install -d -m 0755 -o "$target_user" -g "$target_group" "$target_home/.local"
+
+        if ! sudo -u "$target_user" env \
+            HOME="$target_home" \
+            PATH="/usr/local/bin:/usr/bin:/bin" \
+            /usr/local/bin/npm config set prefix "$target_home/.local"; then
+            log "ERROR" "Failed to configure npm prefix for user '$target_user'"
+            return 1
+        fi
+
+        profile_file="$target_home/.profile"
+        if ! sudo -u "$target_user" touch "$profile_file"; then
+            log "ERROR" "Failed to create $profile_file"
+            return 1
+        fi
+
+        if ! grep -Fqx 'export PATH="$HOME/.local/bin:$PATH"' "$profile_file"; then
+            if ! printf '\n# User-installed npm packages\nexport PATH="$HOME/.local/bin:$PATH"\n' \
+                | sudo -u "$target_user" tee -a "$profile_file" > /dev/null; then
+                log "ERROR" "Failed to update PATH for user '$target_user'"
+                return 1
+            fi
+        fi
+
+        log "SUCCESS" "npm global prefix configured for user '$target_user': $target_home/.local"
+        log "INFO" "User '$target_user' should log in again to apply the PATH change"
+    fi
+
+    if [[ -x /usr/local/bin/node && -x /usr/local/bin/npm ]]; then
+        local installed_node_version
+        local installed_npm_version
+        installed_node_version=$(/usr/local/bin/node --version)
+        installed_npm_version=$(PATH="/usr/local/bin:/usr/bin:/bin" /usr/local/bin/npm --version)
+        log "SUCCESS" "Node.js installed successfully ($installed_node_version, npm $installed_npm_version)"
+        return 0
+    fi
+
+    log "ERROR" "Node.js installation verification failed"
+    return 1
+}
+
 # Install Telegraf
 install_telegraf() {
     log "INFO" "Installing Telegraf..."
@@ -598,6 +818,10 @@ install_all() {
     install_docker || failed_components+=("Docker")
     echo ""
     
+    echo -e "${BLUE}=== Installing Node.js ===${NC}"
+    install_nodejs || failed_components+=("Node.js")
+    echo ""
+
     echo -e "${BLUE}=== Installing Telegraf ===${NC}"
     install_telegraf || failed_components+=("Telegraf")
     echo ""
@@ -627,7 +851,7 @@ pause() {
 show_menu() {
     clear
     echo -e "${BLUE}======================================${NC}"
-    echo -e "${GREEN}        DebianKit v1.1.0${NC}"
+    echo -e "${GREEN}        DebianKit v1.2.0${NC}"
     echo -e "${BLUE}======================================${NC}"
     echo "01. Update Debian Sources"
     echo "02. Initialize User"
@@ -635,6 +859,7 @@ show_menu() {
     echo "04. Install Docker"
     echo "05. Install Telegraf"
     echo "06. Install Komari Agent (Non-Root)"
+    echo "07. Install Node.js (Official Binary)"
     echo ""
     echo "99. Install All"
     echo "00. Exit"
@@ -672,6 +897,9 @@ main() {
                 ;;
             06)
                 install_komari_agent
+                ;;
+            07)
+                install_nodejs
                 ;;
             99)
                 install_all
