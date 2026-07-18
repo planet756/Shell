@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # DebianKit - Debian Environment Setup Tool
-# Version: 1.2.0
+# Version: 1.3.0
 # Author: Planet
 # sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh)"
 
@@ -600,6 +600,348 @@ install_nodejs() {
     return 1
 }
 
+# Install Go from official binary
+install_go() {
+    log "INFO" "Installing Go from official binary..."
+
+    local go_version
+    local go_arch
+    local archive_name
+    local install_prefix="/usr/local"
+    local go_root="/usr/local/go"
+    local current_version=""
+    local version_response
+    local release_metadata
+    local expected_checksum
+    local actual_checksum
+    local temp_dir
+    local staging_dir
+    local backup_dir=""
+    local staged_version
+
+    read -p "Enter Go version (e.g. 1.26.5, press Enter for latest stable): " go_version
+
+    if [[ -z "$go_version" ]]; then
+        log "INFO" "Detecting latest stable Go version..."
+        if ! version_response=$(curl -fsSL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            'https://go.dev/VERSION?m=text'); then
+            log "ERROR" "Failed to retrieve the latest Go version"
+            return 1
+        fi
+        go_version=$(printf '%s\n' "$version_response" | sed -n '1p')
+    fi
+
+    go_version="${go_version#go}"
+    if ! [[ "$go_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log "ERROR" "Invalid Go version: $go_version"
+        return 1
+    fi
+    go_version="go$go_version"
+
+    case "$(uname -m)" in
+        x86_64|amd64)
+            go_arch="amd64"
+            ;;
+        aarch64|arm64)
+            go_arch="arm64"
+            ;;
+        armv6l|armv7l)
+            go_arch="armv6l"
+            ;;
+        i386|i486|i586|i686)
+            go_arch="386"
+            ;;
+        ppc64)
+            go_arch="ppc64"
+            ;;
+        ppc64le)
+            go_arch="ppc64le"
+            ;;
+        riscv64)
+            go_arch="riscv64"
+            ;;
+        s390x)
+            go_arch="s390x"
+            ;;
+        loongarch64|loong64)
+            go_arch="loong64"
+            ;;
+        *)
+            log "ERROR" "Unsupported architecture: $(uname -m)"
+            return 1
+            ;;
+    esac
+
+    archive_name="${go_version}.linux-${go_arch}.tar.gz"
+
+    if [[ -x "$go_root/bin/go" ]]; then
+        current_version=$("$go_root/bin/go" version 2>/dev/null | awk '{ print $3 }')
+    fi
+
+    if [[ "$current_version" == "$go_version" && -x "$go_root/bin/gofmt" ]]; then
+        log "INFO" "Go $go_version is already installed in $go_root"
+    else
+        log "INFO" "Retrieving official Go download metadata..."
+        if ! release_metadata=$(curl -fsSL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            'https://go.dev/dl/?mode=json'); then
+            log "ERROR" "Failed to retrieve Go download metadata"
+            return 1
+        fi
+
+        expected_checksum=$(printf '%s\n' "$release_metadata" | awk -F'"' -v archive="$archive_name" '
+            $2 == "filename" && $4 == archive { found = 1; next }
+            found && $2 == "sha256" { print $4; exit }
+        ')
+
+        if [[ -z "$expected_checksum" ]]; then
+            log "INFO" "Searching archived Go releases..."
+            if ! release_metadata=$(curl -fsSL \
+                --retry 5 \
+                --retry-delay 2 \
+                --retry-all-errors \
+                --connect-timeout 15 \
+                'https://go.dev/dl/?mode=json&include=all'); then
+                log "ERROR" "Failed to retrieve archived Go download metadata"
+                return 1
+            fi
+
+            expected_checksum=$(printf '%s\n' "$release_metadata" | awk -F'"' -v archive="$archive_name" '
+                $2 == "filename" && $4 == archive { found = 1; next }
+                found && $2 == "sha256" { print $4; exit }
+            ')
+        fi
+
+        if ! [[ "$expected_checksum" =~ ^[a-f0-9]{64}$ ]]; then
+            log "ERROR" "Go binary is not listed in the official download metadata: $archive_name"
+            return 1
+        fi
+
+        temp_dir=$(mktemp -d) || {
+            log "ERROR" "Failed to create temporary directory"
+            return 1
+        }
+
+        log "INFO" "Downloading Go $go_version for linux-$go_arch..."
+        if ! curl -fsSL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            "https://go.dev/dl/${archive_name}" \
+            -o "${temp_dir}/${archive_name}"; then
+            log "ERROR" "Failed to download Go binary after retries"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+
+        actual_checksum=$(sha256sum "${temp_dir}/${archive_name}" | awk '{ print $1 }')
+        if [[ "$actual_checksum" != "$expected_checksum" ]]; then
+            log "ERROR" "Go checksum verification failed"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+        log "SUCCESS" "Go checksum verified"
+
+        staging_dir=$(mktemp -d "${install_prefix}/.go-install.XXXXXX") || {
+            log "ERROR" "Failed to create Go staging directory"
+            rm -rf "$temp_dir"
+            return 1
+        }
+
+        if ! tar -xzf "${temp_dir}/${archive_name}" \
+            --no-same-owner \
+            -C "$staging_dir"; then
+            log "ERROR" "Failed to extract Go binary"
+            rm -rf "$temp_dir" "$staging_dir"
+            return 1
+        fi
+
+        if [[ ! -x "$staging_dir/go/bin/go" ]]; then
+            log "ERROR" "Extracted Go binary is missing"
+            rm -rf "$temp_dir" "$staging_dir"
+            return 1
+        fi
+
+        staged_version=$("$staging_dir/go/bin/go" version 2>/dev/null | awk '{ print $3 }')
+        if [[ "$staged_version" != "$go_version" ]]; then
+            log "ERROR" "Extracted Go version does not match the requested version"
+            rm -rf "$temp_dir" "$staging_dir"
+            return 1
+        fi
+
+        if [[ -e "$go_root" || -L "$go_root" ]]; then
+            backup_dir=$(mktemp -d "${install_prefix}/.go-backup.XXXXXX") || {
+                log "ERROR" "Failed to create Go backup path"
+                rm -rf "$temp_dir" "$staging_dir"
+                return 1
+            }
+            if ! rmdir "$backup_dir"; then
+                log "ERROR" "Failed to prepare Go backup path"
+                rm -rf "$temp_dir" "$staging_dir" "$backup_dir"
+                return 1
+            fi
+
+            if ! mv "$go_root" "$backup_dir"; then
+                log "ERROR" "Failed to back up the existing Go installation"
+                rm -rf "$temp_dir" "$staging_dir"
+                return 1
+            fi
+        fi
+
+        if ! mv "$staging_dir/go" "$go_root"; then
+            log "ERROR" "Failed to install Go to $go_root"
+            if [[ -n "$backup_dir" && -e "$backup_dir" ]]; then
+                mv "$backup_dir" "$go_root" 2>/dev/null || true
+            fi
+            rm -rf "$temp_dir" "$staging_dir"
+            return 1
+        fi
+
+        chown -R root:root "$go_root"
+        chmod -R a+rX "$go_root"
+        rm -rf "$temp_dir" "$staging_dir"
+
+        current_version=$("$go_root/bin/go" version 2>/dev/null | awk '{ print $3 }')
+        if [[ "$current_version" != "$go_version" ]]; then
+            log "ERROR" "Go installation verification failed; restoring previous version"
+            rm -rf "$go_root"
+            if [[ -n "$backup_dir" && -e "$backup_dir" ]]; then
+                mv "$backup_dir" "$go_root" 2>/dev/null || true
+            fi
+            return 1
+        fi
+
+        if [[ -n "$backup_dir" && -e "$backup_dir" ]]; then
+            rm -rf "$backup_dir"
+        fi
+        log "SUCCESS" "Go $go_version installed to $go_root"
+    fi
+
+    mkdir -p "$install_prefix/bin"
+    if ! ln -sfn "$go_root/bin/go" "$install_prefix/bin/go" || \
+       ! ln -sfn "$go_root/bin/gofmt" "$install_prefix/bin/gofmt"; then
+        log "ERROR" "Failed to create Go command links in $install_prefix/bin"
+        return 1
+    fi
+
+    local default_user=""
+    local target_user
+    local target_home
+    local target_group
+    local target_gopath
+    local configured_gopath=""
+    local profile_file
+
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] && id "$SUDO_USER" &> /dev/null; then
+        default_user="$SUDO_USER"
+        read -p "Configure GOPATH for user [$default_user] (enter 'skip' to skip): " target_user
+        target_user="${target_user:-$default_user}"
+    else
+        read -p "Enter username to configure GOPATH (press Enter to skip): " target_user
+    fi
+
+    if [[ -z "$target_user" || "${target_user,,}" == "skip" ]]; then
+        log "INFO" "Skipped per-user GOPATH configuration"
+    else
+        if [[ "$target_user" == "root" ]]; then
+            log "ERROR" "GOPATH user configuration must use a non-root user"
+            return 1
+        fi
+        if ! id "$target_user" &> /dev/null; then
+            log "ERROR" "User '$target_user' does not exist"
+            return 1
+        fi
+
+        target_home=$(getent passwd "$target_user" | cut -d: -f6)
+        target_group=$(id -gn "$target_user")
+        if [[ -z "$target_home" || ! -d "$target_home" ]]; then
+            log "ERROR" "Home directory for user '$target_user' does not exist"
+            return 1
+        fi
+
+        target_gopath="$target_home/.local/go"
+        install -d -m 0755 -o "$target_user" -g "$target_group" "$target_gopath"
+
+        if ! sudo -u "$target_user" env \
+            -u GOPATH \
+            -u GOROOT \
+            HOME="$target_home" \
+            PATH="/usr/local/bin:/usr/bin:/bin" \
+            /bin/sh -c 'cd / && exec /usr/local/bin/go env -w GOPATH="$1"' \
+            sh "$target_gopath"; then
+            log "ERROR" "Failed to configure GOPATH for user '$target_user'"
+            return 1
+        fi
+
+        profile_file="$target_home/.profile"
+        if ! sudo -u "$target_user" touch "$profile_file"; then
+            log "ERROR" "Failed to create $profile_file"
+            return 1
+        fi
+
+        if ! grep -Fqx 'export PATH="$HOME/.local/go/bin:$PATH"' "$profile_file"; then
+            if ! printf '\n# User-installed Go commands\nexport PATH="$HOME/.local/go/bin:$PATH"\n' \
+                | sudo -u "$target_user" tee -a "$profile_file" > /dev/null; then
+                log "ERROR" "Failed to update Go PATH for user '$target_user'"
+                return 1
+            fi
+        fi
+
+        if ! configured_gopath=$(sudo -u "$target_user" env \
+            -u GOPATH \
+            -u GOROOT \
+            HOME="$target_home" \
+            PATH="/usr/local/bin:/usr/bin:/bin" \
+            /bin/sh -c 'cd / && exec /usr/local/bin/go env GOPATH'); then
+            log "ERROR" "Failed to verify GOPATH for user '$target_user'"
+            return 1
+        fi
+
+        if [[ "$configured_gopath" != "$target_gopath" ]]; then
+            log "ERROR" "GOPATH verification failed for user '$target_user'"
+            return 1
+        fi
+
+        log "SUCCESS" "GOPATH configured for user '$target_user': $configured_gopath"
+        log "INFO" "If Go-installed commands are not found, run 'source ~/.profile' as user '$target_user'"
+    fi
+
+    if [[ -x "$install_prefix/bin/go" && -x "$install_prefix/bin/gofmt" ]]; then
+        local installed_go_version
+        local installed_goroot
+
+        if ! installed_go_version=$("$install_prefix/bin/go" version 2>/dev/null | awk '{ print $3 }'); then
+            log "ERROR" "Failed to verify Go version"
+            return 1
+        fi
+
+        if ! installed_goroot=$(cd / && \
+            GOROOT= \
+            GOENV=off \
+            PATH="/usr/local/bin:/usr/bin:/bin" \
+            "$install_prefix/bin/go" env GOROOT); then
+            log "ERROR" "Failed to verify GOROOT"
+            return 1
+        fi
+
+        log "SUCCESS" "Go installation verified"
+        log "INFO" "Go version: $installed_go_version"
+        log "INFO" "GOROOT: $installed_goroot"
+        return 0
+    fi
+
+    log "ERROR" "Go installation verification failed"
+    return 1
+}
+
 # Install Telegraf
 install_telegraf() {
     log "INFO" "Installing Telegraf..."
@@ -834,6 +1176,10 @@ install_all() {
     install_nodejs || failed_components+=("Node.js")
     echo ""
 
+    echo -e "${BLUE}=== Installing Go ===${NC}"
+    install_go || failed_components+=("Go")
+    echo ""
+
     echo -e "${BLUE}=== Installing Telegraf ===${NC}"
     install_telegraf || failed_components+=("Telegraf")
     echo ""
@@ -863,7 +1209,7 @@ pause() {
 show_menu() {
     clear
     echo -e "${BLUE}======================================${NC}"
-    echo -e "${GREEN}        DebianKit v1.2.0${NC}"
+    echo -e "${GREEN}        DebianKit v1.3.0${NC}"
     echo -e "${BLUE}======================================${NC}"
     echo "01. Update Debian Sources"
     echo "02. Initialize User"
@@ -872,6 +1218,7 @@ show_menu() {
     echo "05. Install Telegraf"
     echo "06. Install Komari Agent (Non-Root)"
     echo "07. Install Node.js (Official Binary)"
+    echo "08. Install Go (Official Binary)"
     echo ""
     echo "99. Install All"
     echo "00. Exit"
@@ -916,6 +1263,9 @@ main() {
                 ;;
             07)
                 install_nodejs
+                ;;
+            08)
+                install_go
                 ;;
             99)
                 install_all
