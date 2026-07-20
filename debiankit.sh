@@ -273,34 +273,96 @@ EOF
     fi
 }
 
-# Install Docker
+# Install or update Docker
 install_docker() {
-    log "INFO" "Installing Docker..."
+    log "INFO" "Setting up Docker..."
 
-    # Check if already installed
+    local docker_package=""
+    local docker_version=""
+    local previous_version=""
+    local update_docker=""
+    local apply_docker_config=""
+    local docker_restart_required="no"
+
     if command -v docker &> /dev/null; then
-        local docker_version=$(docker --version 2>/dev/null | cut -d' ' -f3 | cut -d',' -f1)
+        docker_version=$(docker --version 2>/dev/null | cut -d' ' -f3 | cut -d',' -f1)
+        previous_version="$docker_version"
         log "SUCCESS" "Docker is already installed (version: $docker_version)"
-        return 0
-    fi
 
-    # Create keyrings directory
-    install -m 0755 -d /etc/apt/keyrings
+        if dpkg-query -W -f='${Status}' docker-ce 2>/dev/null | grep -q "install ok installed"; then
+            docker_package="docker-ce"
+        elif dpkg-query -W -f='${Status}' docker.io 2>/dev/null | grep -q "install ok installed"; then
+            docker_package="docker.io"
+        else
+            log "WARN" "Unsupported Docker installation; skipping"
+            return 0
+        fi
 
-    # Add Docker GPG key
-    log "INFO" "Adding Docker GPG key..."
-    if curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc 2>/dev/null; then
-        chmod a+r /etc/apt/keyrings/docker.asc
-        log "SUCCESS" "Docker GPG key added"
+        while true; do
+            read -r -p "Update Docker? [Y/n]: " update_docker
+            case "$update_docker" in
+                ""|[Yy])
+                    update_docker="yes"
+                    break
+                    ;;
+                [Nn])
+                    update_docker="no"
+                    break
+                    ;;
+                *)
+                    log "WARN" "Please enter y or n"
+                    ;;
+            esac
+        done
+
+        if [[ "$update_docker" == "yes" ]]; then
+            log "INFO" "Updating package list..."
+            apt-get update > /dev/null 2>&1 || {
+                log "ERROR" "Failed to update package list"
+                return 1
+            }
+
+            log "INFO" "Updating Docker..."
+            if [[ "$docker_package" == "docker-ce" ]]; then
+                apt-get install -y --only-upgrade docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras > /dev/null 2>&1 || {
+                    log "ERROR" "Failed to update Docker"
+                    return 1
+                }
+            else
+                apt-get install -y --only-upgrade docker.io > /dev/null 2>&1 || {
+                    log "ERROR" "Failed to update Docker"
+                    return 1
+                }
+            fi
+
+            docker_version=$(docker --version 2>/dev/null | cut -d' ' -f3 | cut -d',' -f1)
+            if [[ "$docker_version" == "$previous_version" ]]; then
+                log "SUCCESS" "Docker is up to date"
+            else
+                log "SUCCESS" "Docker updated (version: $docker_version)"
+            fi
+        else
+            log "INFO" "Docker update skipped"
+        fi
     else
-        log "ERROR" "Failed to download Docker GPG key"
-        return 1
-    fi
+        # Create keyrings directory
+        install -m 0755 -d /etc/apt/keyrings
 
-    # Add Docker repository using DEB822 format
-    log "INFO" "Adding Docker repository..."
-    local debian_version=$(. /etc/os-release && echo "$VERSION_CODENAME")
-    tee /etc/apt/sources.list.d/docker.sources > /dev/null << EOF
+        # Add Docker GPG key
+        log "INFO" "Adding Docker GPG key..."
+        if curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc 2>/dev/null; then
+            chmod a+r /etc/apt/keyrings/docker.asc
+            log "SUCCESS" "Docker GPG key added"
+        else
+            log "ERROR" "Failed to download Docker GPG key"
+            return 1
+        fi
+
+        # Add Docker repository using DEB822 format
+        log "INFO" "Adding Docker repository..."
+        local debian_version
+        debian_version=$(. /etc/os-release && echo "$VERSION_CODENAME")
+        tee /etc/apt/sources.list.d/docker.sources > /dev/null << EOF
 Types: deb
 URIs: https://download.docker.com/linux/debian
 Suites: $debian_version
@@ -308,39 +370,106 @@ Components: stable
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
 
-    # Update package list
-    log "INFO" "Updating package list..."
-    apt-get update > /dev/null 2>&1 || {
-        log "ERROR" "Failed to update package list"
-        return 1
-    }
+        # Update package list
+        log "INFO" "Updating package list..."
+        apt-get update > /dev/null 2>&1 || {
+            log "ERROR" "Failed to update package list"
+            return 1
+        }
 
-    # Install Docker packages
-    log "INFO" "Installing Docker packages (this may take a few minutes)..."
-    if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin > /dev/null 2>&1; then
-        log "SUCCESS" "Docker packages installed"
-    else
-        log "ERROR" "Failed to install Docker packages"
+        # Install Docker packages
+        log "INFO" "Installing Docker packages (this may take a few minutes)..."
+        if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin > /dev/null 2>&1; then
+            log "SUCCESS" "Docker packages installed"
+        else
+            log "ERROR" "Failed to install Docker packages"
+            return 1
+        fi
+    fi
+
+    # Configure Docker daemon
+    log "INFO" "Configuring Docker..."
+    install -m 0755 -d /etc/docker
+
+    if [[ -f /etc/docker/daemon.json ]]; then
+        log "WARN" "Docker configuration already exists; skipping"
+    elif [[ -e /etc/docker/daemon.json ]]; then
+        log "ERROR" "/etc/docker/daemon.json exists but is not a regular file"
         return 1
+    else
+        while true; do
+            read -r -p "Apply Docker configuration? [Y/n]: " apply_docker_config
+            case "$apply_docker_config" in
+                ""|[Yy])
+                    apply_docker_config="yes"
+                    break
+                    ;;
+                [Nn])
+                    apply_docker_config="no"
+                    break
+                    ;;
+                *)
+                    log "WARN" "Please enter y or n"
+                    ;;
+            esac
+        done
+
+        if [[ "$apply_docker_config" == "yes" ]]; then
+            cat > /etc/docker/daemon.json << 'EOF'
+{
+  "live-restore": true,
+  "log-driver": "local",
+  "log-opts": {
+    "max-size": "20m",
+    "max-file": "5",
+    "compress": "true"
+  }
+}
+EOF
+            chmod 0644 /etc/docker/daemon.json
+
+            if dockerd --validate --config-file=/etc/docker/daemon.json > /dev/null 2>&1; then
+                docker_restart_required="yes"
+                log "SUCCESS" "Docker configured"
+            else
+                rm -f /etc/docker/daemon.json
+                log "ERROR" "Docker configuration validation failed"
+                return 1
+            fi
+        else
+            log "INFO" "Docker configuration skipped"
+        fi
     fi
 
     # Start and enable Docker service
-    log "INFO" "Starting Docker service..."
-    systemctl enable docker --now > /dev/null 2>&1 || {
-        log "ERROR" "Failed to start Docker service"
+    systemctl enable docker > /dev/null 2>&1 || {
+        log "ERROR" "Failed to enable Docker service"
         return 1
     }
+
+    if [[ "$docker_restart_required" == "yes" ]]; then
+        log "INFO" "Restarting Docker service..."
+        systemctl restart docker > /dev/null 2>&1 || {
+            log "ERROR" "Failed to restart Docker service"
+            return 1
+        }
+    elif ! systemctl is-active --quiet docker; then
+        log "INFO" "Starting Docker service..."
+        systemctl start docker > /dev/null 2>&1 || {
+            log "ERROR" "Failed to start Docker service"
+            return 1
+        }
+    fi
 
     # Wait for Docker to be ready
     sleep 2
 
     # Verify installation
     if command -v docker &> /dev/null && systemctl is-active --quiet docker; then
-        local docker_version=$(docker --version 2>/dev/null | cut -d' ' -f3 | cut -d',' -f1)
-        log "SUCCESS" "Docker installed successfully (version: $docker_version)"
-        docker --version
+        docker_version=$(docker --version 2>/dev/null | cut -d' ' -f3 | cut -d',' -f1)
+        log "SUCCESS" "Docker is ready (version: $docker_version)"
     else
-        log "ERROR" "Docker installation verification failed"
+        log "ERROR" "Docker verification failed"
         return 1
     fi
 
@@ -942,48 +1071,104 @@ install_go() {
     return 1
 }
 
-# Install Telegraf
+# Install or update Telegraf
 install_telegraf() {
-    log "INFO" "Installing Telegraf..."
+    log "INFO" "Setting up Telegraf..."
 
-    # Check if already installed
+    local key_file="/tmp/influxdata-archive.key"
+    local telegraf_version=""
+    local previous_package_version=""
+    local current_package_version=""
+    local update_telegraf=""
+    local telegraf_restart_required="no"
+
     if command -v telegraf &> /dev/null; then
-        local telegraf_version=$(telegraf version 2>/dev/null | head -n1 || echo "unknown")
+        telegraf_version=$(telegraf version 2>/dev/null | head -n1 || echo "unknown")
         log "SUCCESS" "Telegraf is already installed ($telegraf_version)"
-        return 0
-    fi
 
-    # Download and verify InfluxData GPG key
-    log "INFO" "Adding InfluxData repository..."
-    cd /tmp || error_exit "Failed to change to /tmp directory"
+        if ! dpkg-query -W -f='${Status}' telegraf 2>/dev/null | grep -q "install ok installed"; then
+            log "WARN" "Unsupported Telegraf installation; skipping"
+            return 0
+        fi
 
-    # Download GPG key
-    if ! curl -sL -o influxdata-archive.key https://repos.influxdata.com/influxdata-archive.key; then
-        log "ERROR" "Failed to download InfluxData GPG key"
-        return 1
-    fi
+        while true; do
+            read -r -p "Update Telegraf? [Y/n]: " update_telegraf
+            case "$update_telegraf" in
+                ""|[Yy])
+                    update_telegraf="yes"
+                    break
+                    ;;
+                [Nn])
+                    update_telegraf="no"
+                    break
+                    ;;
+                *)
+                    log "WARN" "Please enter y or n"
+                    ;;
+            esac
+        done
 
-    # Verify GPG key fingerprint
-    log "INFO" "Verifying GPG key fingerprint..."
-    if gpg --show-keys --with-fingerprint --with-colons ./influxdata-archive.key 2>&1 \
-       | grep '^fpr:' | grep -q '24C975CBA61A024EE1B631787C3D57159FC2F927'; then
-        log "SUCCESS" "GPG key verified"
+        if [[ "$update_telegraf" == "yes" ]]; then
+            previous_package_version=$(dpkg-query -W -f='${Version}' telegraf 2>/dev/null)
+
+            log "INFO" "Updating package list..."
+            apt-get update > /dev/null 2>&1 || {
+                log "ERROR" "Failed to update package list"
+                return 1
+            }
+
+            log "INFO" "Updating Telegraf..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade \
+                -o Dpkg::Options::="--force-confold" telegraf > /dev/null 2>&1 || {
+                log "ERROR" "Failed to update Telegraf"
+                return 1
+            }
+
+            current_package_version=$(dpkg-query -W -f='${Version}' telegraf 2>/dev/null)
+            if [[ "$current_package_version" == "$previous_package_version" ]]; then
+                log "SUCCESS" "Telegraf is up to date"
+            else
+                telegraf_restart_required="yes"
+                log "SUCCESS" "Telegraf updated"
+            fi
+        else
+            log "INFO" "Telegraf update skipped"
+        fi
     else
-        log "ERROR" "GPG key fingerprint verification failed"
-        rm -f /tmp/influxdata-archive.key
-        return 1
-    fi
+        log "INFO" "Adding InfluxData repository..."
+        rm -f "$key_file"
 
-    # Add GPG key and repository using DEB822 format
-    if cat influxdata-archive.key | gpg --dearmor | tee /etc/apt/trusted.gpg.d/influxdata-archive.gpg > /dev/null 2>&1; then
-        log "SUCCESS" "GPG key added"
-    else
-        log "ERROR" "Failed to add GPG key"
-        rm -f /tmp/influxdata-archive.key
-        return 1
-    fi
+        if ! curl -fsSL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            -o "$key_file" \
+            https://repos.influxdata.com/influxdata-archive.key; then
+            log "ERROR" "Failed to download InfluxData GPG key"
+            return 1
+        fi
 
-    tee /etc/apt/sources.list.d/influxdata.sources > /dev/null << EOF
+        if gpg --show-keys --with-fingerprint --with-colons "$key_file" 2>&1 \
+           | grep '^fpr:' | grep -q '24C975CBA61A024EE1B631787C3D57159FC2F927'; then
+            log "SUCCESS" "GPG key verified"
+        else
+            log "ERROR" "GPG key fingerprint verification failed"
+            rm -f "$key_file"
+            return 1
+        fi
+
+        if gpg --dearmor --yes \
+            --output /etc/apt/trusted.gpg.d/influxdata-archive.gpg \
+            "$key_file" > /dev/null 2>&1; then
+            log "SUCCESS" "GPG key added"
+        else
+            log "ERROR" "Failed to add GPG key"
+            rm -f "$key_file"
+            return 1
+        fi
+
+        tee /etc/apt/sources.list.d/influxdata.sources > /dev/null << EOF
 Types: deb
 URIs: https://repos.influxdata.com/debian
 Suites: stable
@@ -991,57 +1176,87 @@ Components: main
 Signed-By: /etc/apt/trusted.gpg.d/influxdata-archive.gpg
 EOF
 
-    # Update and install
-    log "INFO" "Installing Telegraf from repository..."
-    if apt-get update > /dev/null 2>&1 && apt-get install -y telegraf > /dev/null 2>&1; then
-        # Create log directory if not exists
-        mkdir -p /var/log/telegraf
+        log "INFO" "Installing Telegraf..."
+        if ! apt-get update > /dev/null 2>&1 || \
+           ! apt-get install -y telegraf > /dev/null 2>&1; then
+            log "ERROR" "Failed to install Telegraf"
+            rm -f "$key_file"
+            return 1
+        fi
 
-        # Create log file and set permissions
-        log "INFO" "Configuring Telegraf logging..."
+        mkdir -p /var/log/telegraf
         touch /var/log/telegraf/telegraf.log
         chown telegraf:telegraf /var/log/telegraf/telegraf.log
         chown telegraf:telegraf /var/log/telegraf
-
-        # Start service
-        systemctl enable telegraf --now > /dev/null 2>&1
-
-        # Verify service status
-        if systemctl is-active --quiet telegraf; then
-            log "SUCCESS" "Telegraf installed and service is running"
-            telegraf version 2>/dev/null | head -n1 || true
-        else
-            log "WARN" "Telegraf installed but service is not running"
-        fi
-
-        # Cleanup
-        rm -f /tmp/influxdata-archive.key
-        return 0
-    else
-        log "ERROR" "Failed to install Telegraf"
-        rm -f /tmp/influxdata-archive.key
-        return 1
+        rm -f "$key_file"
+        log "SUCCESS" "Telegraf installed"
     fi
+
+    systemctl enable telegraf > /dev/null 2>&1 || {
+        log "ERROR" "Failed to enable Telegraf service"
+        return 1
+    }
+
+    if [[ "$telegraf_restart_required" == "yes" ]]; then
+        systemctl restart telegraf > /dev/null 2>&1 || {
+            log "ERROR" "Failed to restart Telegraf service"
+            return 1
+        }
+    elif ! systemctl is-active --quiet telegraf; then
+        systemctl start telegraf > /dev/null 2>&1 || {
+            log "ERROR" "Failed to start Telegraf service"
+            return 1
+        }
+    fi
+
+    if systemctl is-active --quiet telegraf; then
+        telegraf_version=$(telegraf version 2>/dev/null | head -n1 || echo "unknown")
+        log "SUCCESS" "Telegraf is ready ($telegraf_version)"
+        return 0
+    fi
+
+    log "ERROR" "Telegraf verification failed"
+    return 1
 }
 
-# Install Komari Agent (Non-Root)
+# Install or update Komari Agent (Non-Root)
 install_komari_agent() {
-    log "INFO" "Installing Komari Agent (Non-Root Mode)..."
+    log "INFO" "Setting up Komari Agent..."
 
     local target_user="komari"
     local target_home="/home/$target_user"
     local target_dir="${target_home}/.komari"
     local target_file="${target_dir}/komari-agent"
     local config_file="${target_dir}/komari-agent.conf"
+    local traffic_file="${target_dir}/net_static.json"
     local is_update=false
+    local update_agent=""
+    local komari_arch=""
+    local download_url=""
+    local temp_file=""
+    local config_temp=""
+    local backup_file=""
+    local traffic_backup=""
+    local run_params=""
+    local original_run_params=""
+    local rollback_run_params=""
+    local update_config="n"
+    local reset_traffic="n"
+    local write_config="no"
+    local config_existed="no"
+    local agent_was_running="no"
+    local server_url=""
+    local token=""
+    local additional_params=""
 
     if id "$target_user" &>/dev/null; then
-        log "INFO" "User '$target_user' exists, skipping creation"
+        log "INFO" "User '$target_user' exists"
     else
         log "INFO" "Creating user '$target_user'..."
         useradd --uid 5774 --create-home --shell /usr/sbin/nologin "$target_user" 2>/dev/null || \
         useradd --create-home --shell /usr/sbin/nologin "$target_user" || {
-            log "ERROR" "Failed to create user"; return 1
+            log "ERROR" "Failed to create user"
+            return 1
         }
         echo "${target_user}:$(openssl rand -base64 32)" | chpasswd 2>/dev/null
         log "SUCCESS" "User '$target_user' created"
@@ -1052,107 +1267,263 @@ install_komari_agent() {
         chown "$target_user:$target_user" "$target_dir"
     fi
 
-    if [[ -f "${target_home}/net_static.json" && ! -f "${target_dir}/net_static.json" ]]; then
-        log "INFO" "Migrating traffic data to .komari directory..."
-        mv "${target_home}/net_static.json" "${target_dir}/net_static.json"
-        chown "$target_user:$target_user" "${target_dir}/net_static.json"
+    if [[ -f "${target_home}/net_static.json" && ! -f "$traffic_file" ]]; then
+        mv "${target_home}/net_static.json" "$traffic_file"
+        chown "$target_user:$target_user" "$traffic_file"
     fi
 
-    [[ -f "$target_file" ]] && is_update=true && log "INFO" "Existing agent found, updating..."
-
-    if $is_update && sudo -u "$target_user" screen -ls 2>/dev/null | grep -q "komari"; then
-        log "INFO" "Stopping running agent (waiting for data flush)..."
-        sudo -u "$target_user" screen -S komari -p 0 -X stuff $'\003'
-        sleep 3
-        sudo -u "$target_user" screen -S komari -X quit 2>/dev/null
-        sleep 1
+    if [[ -f "$config_file" ]]; then
+        config_existed="yes"
+        original_run_params=$(cat "$config_file")
     fi
 
-    local komari_arch=""
+    if [[ -f "$target_file" ]]; then
+        is_update=true
+        log "SUCCESS" "Komari Agent is already installed"
+
+        while true; do
+            read -r -p "Update Komari Agent? [Y/n]: " update_agent
+            case "$update_agent" in
+                ""|[Yy])
+                    update_agent="yes"
+                    break
+                    ;;
+                [Nn])
+                    update_agent="no"
+                    break
+                    ;;
+                *)
+                    log "WARN" "Please enter y or n"
+                    ;;
+            esac
+        done
+
+        if [[ "$update_agent" == "no" ]]; then
+            log "INFO" "Komari Agent update skipped"
+            return 0
+        fi
+    fi
+
     case $(uname -m) in
         x86_64)    komari_arch="amd64" ;;
         i386|i686) komari_arch="386" ;;
         aarch64)   komari_arch="arm64" ;;
         riscv64)   komari_arch="riscv64" ;;
-        *) log "ERROR" "Unsupported architecture: $(uname -m)"; return 1 ;;
+        *)
+            log "ERROR" "Unsupported architecture: $(uname -m)"
+            return 1
+            ;;
     esac
 
-    local download_url="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${komari_arch}"
-    log "INFO" "Downloading komari-agent-linux-${komari_arch}..."
-
-    rm -f "$target_file"
-    curl -sL -f -o "$target_file" "$download_url" || {
-        log "ERROR" "Download failed"; return 1
+    download_url="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-${komari_arch}"
+    temp_file=$(mktemp "${target_dir}/.komari-agent.XXXXXX") || {
+        log "ERROR" "Failed to create temporary file"
+        return 1
     }
-    chown "$target_user:$target_user" "$target_file"
-    chmod +x "$target_file"
-    log "SUCCESS" "Agent downloaded ($(ls -lh "$target_file" | awk '{print $5}'))"
+
+    log "INFO" "Downloading Komari Agent..."
+    if ! curl -fsSL \
+        --retry 5 \
+        --retry-delay 2 \
+        --retry-all-errors \
+        --connect-timeout 15 \
+        -o "$temp_file" \
+        "$download_url"; then
+        rm -f "$temp_file"
+        log "ERROR" "Download failed"
+        return 1
+    fi
+
+    if [[ ! -s "$temp_file" ]]; then
+        rm -f "$temp_file"
+        log "ERROR" "Downloaded file is empty"
+        return 1
+    fi
+
+    chown "$target_user:$target_user" "$temp_file"
+    chmod 0755 "$temp_file"
 
     if $is_update; then
-        local run_params=""
-        local update_config="n"
-
         echo ""
         read -p "Update configuration? [y/N]: " update_config
 
         if [[ "${update_config,,}" == "y" ]]; then
             read -p "Server URL (-e): " server_url
             read -p "Token (-t): " token
-            [[ -z "$server_url" || -z "$token" ]] && { log "ERROR" "Server URL and Token required"; return 1; }
+            if [[ -z "$server_url" || -z "$token" ]]; then
+                rm -f "$temp_file"
+                log "ERROR" "Server URL and Token required"
+                return 1
+            fi
             read -p "Additional parameters (optional): " additional_params
             run_params="-e ${server_url} -t ${token} ${additional_params}"
-            echo "$run_params" > "$config_file"
-            chown "$target_user:$target_user" "$config_file"
-            chmod 600 "$config_file"
-            log "SUCCESS" "Configuration updated"
+            write_config="yes"
 
-            local reset_traffic="n"
             read -p "Reset traffic statistics? [y/N]: " reset_traffic
-            if [[ "${reset_traffic,,}" == "y" ]]; then
-                rm -f "${target_dir}/net_static.json"
-                log "INFO" "Traffic statistics reset"
-            fi
-        elif [[ -f "$config_file" ]]; then
-            run_params=$(cat "$config_file")
-            log "INFO" "Using saved configuration"
+        elif [[ "$config_existed" == "yes" ]]; then
+            run_params="$original_run_params"
         else
-            log "WARN" "No config found, start manually with parameters"
+            rm -f "$temp_file"
+            log "WARN" "Komari Agent update skipped"
             return 0
         fi
-
-        sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $run_params"
-        log "SUCCESS" "Agent updated and restarted"
-        return 0
+    else
+        echo ""
+        read -p "Server URL (-e): " server_url
+        read -p "Token (-t): " token
+        if [[ -z "$server_url" || -z "$token" ]]; then
+            rm -f "$temp_file"
+            log "ERROR" "Server URL and Token required"
+            return 1
+        fi
+        read -p "Additional parameters (optional): " additional_params
+        run_params="-e ${server_url} -t ${token} ${additional_params}"
+        write_config="yes"
     fi
 
-    echo ""
-    read -p "Server URL (-e): " server_url
-    read -p "Token (-t): " token
-    [[ -z "$server_url" || -z "$token" ]] && { log "ERROR" "Server URL and Token required"; return 1; }
+    rollback_run_params="$original_run_params"
+    [[ -z "$rollback_run_params" ]] && rollback_run_params="$run_params"
 
-    read -p "Additional parameters (optional): " additional_params
-    local run_params="-e ${server_url} -t ${token} ${additional_params}"
+    if [[ "$write_config" == "yes" ]]; then
+        config_temp=$(mktemp "${target_dir}/.komari-agent.conf.XXXXXX") || {
+            rm -f "$temp_file"
+            log "ERROR" "Failed to create temporary configuration"
+            return 1
+        }
+        if ! printf '%s\n' "$run_params" > "$config_temp"; then
+            rm -f "$temp_file" "$config_temp"
+            log "ERROR" "Failed to write configuration"
+            return 1
+        fi
+        chown "$target_user:$target_user" "$config_temp"
+        chmod 0600 "$config_temp"
+    fi
 
-    echo "$run_params" > "$config_file"
-    chown "$target_user:$target_user" "$config_file"
-    chmod 600 "$config_file"
+    if ! command -v screen &>/dev/null; then
+        if ! apt-get update -qq || ! apt-get install -y -qq screen; then
+            rm -f "$temp_file" "$config_temp"
+            log "ERROR" "Failed to install screen"
+            return 1
+        fi
+    fi
 
-    command -v screen &>/dev/null || {
-        apt-get update -qq && apt-get install -y -qq screen || { log "ERROR" "Failed to install screen"; return 1; }
-    }
+    if [[ "${reset_traffic,,}" == "y" && -f "$traffic_file" ]]; then
+        traffic_backup=$(mktemp "${target_dir}/.net_static.backup.XXXXXX") || {
+            rm -f "$temp_file" "$config_temp"
+            log "ERROR" "Failed to create traffic backup"
+            return 1
+        }
+        rm -f "$traffic_backup"
+    fi
+
+    if $is_update; then
+        backup_file=$(mktemp "${target_dir}/.komari-agent.backup.XXXXXX") || {
+            rm -f "$temp_file" "$config_temp"
+            log "ERROR" "Failed to create backup file"
+            return 1
+        }
+        if ! cp -p "$target_file" "$backup_file"; then
+            rm -f "$temp_file" "$config_temp" "$backup_file"
+            log "ERROR" "Failed to back up Komari Agent"
+            return 1
+        fi
+
+        if sudo -u "$target_user" screen -ls 2>/dev/null | grep -q "komari"; then
+            agent_was_running="yes"
+            sudo -u "$target_user" screen -S komari -p 0 -X stuff $'\003'
+            sleep 3
+            sudo -u "$target_user" screen -S komari -X quit 2>/dev/null
+            sleep 1
+        fi
+
+        if [[ -n "$traffic_backup" ]] && ! mv "$traffic_file" "$traffic_backup"; then
+            rm -f "$temp_file" "$config_temp" "$backup_file" "$traffic_backup"
+            if [[ "$agent_was_running" == "yes" ]]; then
+                sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $rollback_run_params"
+            fi
+            log "ERROR" "Failed to reset traffic statistics"
+            return 1
+        fi
+    fi
+
+    if ! mv -f "$temp_file" "$target_file"; then
+        [[ -n "$traffic_backup" ]] && mv -f "$traffic_backup" "$traffic_file"
+        if [[ "$agent_was_running" == "yes" ]]; then
+            sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $rollback_run_params"
+        fi
+        rm -f "$temp_file" "$config_temp" "$backup_file"
+        log "ERROR" "Failed to install Komari Agent"
+        return 1
+    fi
+
+    if [[ -n "$config_temp" ]]; then
+        if ! mv -f "$config_temp" "$config_file"; then
+            if $is_update && [[ -f "$backup_file" ]]; then
+                mv -f "$backup_file" "$target_file"
+                [[ -n "$traffic_backup" ]] && mv -f "$traffic_backup" "$traffic_file"
+                if [[ "$agent_was_running" == "yes" ]]; then
+                    sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $rollback_run_params"
+                fi
+            else
+                rm -f "$target_file"
+            fi
+            rm -f "$config_temp"
+            log "ERROR" "Failed to install configuration"
+            return 1
+        fi
+    fi
 
     sudo -u "$target_user" screen -S komari -X quit 2>/dev/null
-    sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $run_params" || {
-        log "ERROR" "Failed to start agent"; return 1
-    }
+    if ! sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $run_params"; then
+        if $is_update && [[ -f "$backup_file" ]]; then
+            mv -f "$backup_file" "$target_file"
+            if [[ "$write_config" == "yes" ]]; then
+                if [[ "$config_existed" == "yes" ]]; then
+                    printf '%s\n' "$original_run_params" > "$config_file"
+                    chown "$target_user:$target_user" "$config_file"
+                    chmod 0600 "$config_file"
+                else
+                    rm -f "$config_file"
+                fi
+            fi
+            [[ -n "$traffic_backup" ]] && mv -f "$traffic_backup" "$traffic_file"
+            if [[ "$agent_was_running" == "yes" ]]; then
+                sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $rollback_run_params"
+            fi
+        fi
+        log "ERROR" "Failed to start agent"
+        return 1
+    fi
 
     sleep 1
-    if sudo -u "$target_user" screen -ls 2>/dev/null | grep -q "komari"; then
-        log "SUCCESS" "Komari Agent started"
-        echo ""
-        log "INFO" "Commands: attach=sudo -u komari screen -r komari | stop=sudo -u komari screen -S komari -X quit"
+    if ! sudo -u "$target_user" screen -ls 2>/dev/null | grep -q "komari"; then
+        sudo -u "$target_user" screen -S komari -X quit 2>/dev/null
+        if $is_update && [[ -f "$backup_file" ]]; then
+            mv -f "$backup_file" "$target_file"
+            if [[ "$write_config" == "yes" ]]; then
+                if [[ "$config_existed" == "yes" ]]; then
+                    printf '%s\n' "$original_run_params" > "$config_file"
+                    chown "$target_user:$target_user" "$config_file"
+                    chmod 0600 "$config_file"
+                else
+                    rm -f "$config_file"
+                fi
+            fi
+            [[ -n "$traffic_backup" ]] && mv -f "$traffic_backup" "$traffic_file"
+            if [[ "$agent_was_running" == "yes" ]]; then
+                sudo -u "$target_user" bash -c "cd '$target_dir' && screen -dmS komari ./komari-agent $rollback_run_params"
+            fi
+        fi
+        log "ERROR" "Agent failed to start"
+        return 1
+    fi
+
+    rm -f "$backup_file" "$traffic_backup"
+
+    if $is_update; then
+        log "SUCCESS" "Komari Agent updated"
     else
-        log "ERROR" "Agent failed to start"; return 1
+        log "SUCCESS" "Komari Agent started"
     fi
 }
 
