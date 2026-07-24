@@ -285,6 +285,7 @@ install_docker() {
     local docker_restart_required="no"
     local docker_installed="no"
     local source_file="/etc/apt/sources.list.d/docker.sources"
+    local legacy_source_file="/etc/apt/sources.list.d/docker.list"
     local key_file="/etc/apt/keyrings/docker.asc"
     local debian_version=""
 
@@ -319,6 +320,20 @@ install_docker() {
 
         install -m 0755 -d /etc/apt/keyrings
 
+        if [[ -e "$legacy_source_file" ]]; then
+            if [[ ! -f "$legacy_source_file" ]]; then
+                log "ERROR" "$legacy_source_file exists but is not a regular file"
+                return 1
+            fi
+
+            if rm -f "$legacy_source_file"; then
+                log "SUCCESS" "Removed legacy Docker repository"
+            else
+                log "ERROR" "Failed to remove legacy Docker repository"
+                return 1
+            fi
+        fi
+
         if [[ ! -f "$key_file" ]]; then
             log "INFO" "Adding Docker GPG key..."
             if curl -fsSL https://download.docker.com/linux/debian/gpg -o "$key_file" 2>/dev/null; then
@@ -344,7 +359,11 @@ install_docker() {
             fi
 
             if [[ -f "$source_file" ]]; then
-                log "INFO" "Docker repository does not match Debian $debian_version; updating..."
+                log "INFO" "Docker repository does not match Debian $debian_version; replacing..."
+                if ! rm -f "$source_file"; then
+                    log "ERROR" "Failed to remove the previous Docker repository"
+                    return 1
+                fi
             else
                 log "INFO" "Adding Docker repository for Debian $debian_version..."
             fi
