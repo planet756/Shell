@@ -283,8 +283,13 @@ install_docker() {
     local update_docker=""
     local apply_docker_config=""
     local docker_restart_required="no"
+    local docker_installed="no"
+    local source_file="/etc/apt/sources.list.d/docker.sources"
+    local key_file="/etc/apt/keyrings/docker.asc"
+    local debian_version=""
 
     if command -v docker &> /dev/null; then
+        docker_installed="yes"
         docker_version=$(docker --version 2>/dev/null | cut -d' ' -f3 | cut -d',' -f1)
         previous_version="$docker_version"
         log "SUCCESS" "Docker is already installed (version: $docker_version)"
@@ -297,7 +302,65 @@ install_docker() {
             log "WARN" "Unsupported Docker installation; skipping"
             return 0
         fi
+    fi
 
+    # Docker CE uses the official repository; keep its release in sync with Debian.
+    if [[ "$docker_installed" == "no" || "$docker_package" == "docker-ce" ]]; then
+        if [[ ! -r /etc/os-release ]]; then
+            log "ERROR" "Cannot determine the current Debian release"
+            return 1
+        fi
+
+        debian_version=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+        if [[ -z "$debian_version" ]]; then
+            log "ERROR" "Cannot determine the current Debian codename"
+            return 1
+        fi
+
+        install -m 0755 -d /etc/apt/keyrings
+
+        if [[ ! -f "$key_file" ]]; then
+            log "INFO" "Adding Docker GPG key..."
+            if curl -fsSL https://download.docker.com/linux/debian/gpg -o "$key_file" 2>/dev/null; then
+                chmod a+r "$key_file"
+                log "SUCCESS" "Docker GPG key added"
+            else
+                log "ERROR" "Failed to download Docker GPG key"
+                return 1
+            fi
+        fi
+
+        if [[ -f "$source_file" ]] &&
+           grep -Fxq "Types: deb" "$source_file" &&
+           grep -Fxq "URIs: https://download.docker.com/linux/debian" "$source_file" &&
+           grep -Fxq "Suites: $debian_version" "$source_file" &&
+           grep -Fxq "Components: stable" "$source_file" &&
+           grep -Fxq "Signed-By: $key_file" "$source_file"; then
+            log "INFO" "Docker repository already matches Debian $debian_version"
+        else
+            if [[ -e "$source_file" && ! -f "$source_file" ]]; then
+                log "ERROR" "$source_file exists but is not a regular file"
+                return 1
+            fi
+
+            if [[ -f "$source_file" ]]; then
+                log "INFO" "Docker repository does not match Debian $debian_version; updating..."
+            else
+                log "INFO" "Adding Docker repository for Debian $debian_version..."
+            fi
+
+            cat > "$source_file" << EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: $debian_version
+Components: stable
+Signed-By: $key_file
+EOF
+            log "SUCCESS" "Docker repository configured for Debian $debian_version"
+        fi
+    fi
+
+    if [[ "$docker_installed" == "yes" ]]; then
         while true; do
             read -r -p "Update Docker? [Y/n]: " update_docker
             case "$update_docker" in
@@ -345,31 +408,6 @@ install_docker() {
             log "INFO" "Docker update skipped"
         fi
     else
-        # Create keyrings directory
-        install -m 0755 -d /etc/apt/keyrings
-
-        # Add Docker GPG key
-        log "INFO" "Adding Docker GPG key..."
-        if curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc 2>/dev/null; then
-            chmod a+r /etc/apt/keyrings/docker.asc
-            log "SUCCESS" "Docker GPG key added"
-        else
-            log "ERROR" "Failed to download Docker GPG key"
-            return 1
-        fi
-
-        # Add Docker repository using DEB822 format
-        log "INFO" "Adding Docker repository..."
-        local debian_version
-        debian_version=$(. /etc/os-release && echo "$VERSION_CODENAME")
-        tee /etc/apt/sources.list.d/docker.sources > /dev/null << EOF
-Types: deb
-URIs: https://download.docker.com/linux/debian
-Suites: $debian_version
-Components: stable
-Signed-By: /etc/apt/keyrings/docker.asc
-EOF
-
         # Update package list
         log "INFO" "Updating package list..."
         apt-get update > /dev/null 2>&1 || {
