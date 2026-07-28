@@ -1132,14 +1132,26 @@ install_go() {
 install_telegraf() {
     log "INFO" "Setting up Telegraf..."
 
-    local key_file="/tmp/influxdata-archive.key"
+    local source_file="/etc/apt/sources.list.d/influxdata.sources"
+    local legacy_source_file="/etc/apt/sources.list.d/influxdata.list"
+    local key_file="/etc/apt/keyrings/influxdata-archive.gpg"
+    local legacy_key_file="/etc/apt/trusted.gpg.d/influxdata-archive.gpg"
+    local key_fingerprint="24C975CBA61A024EE1B631787C3D57159FC2F927"
+    local key_download=""
+    local key_temp=""
+    local key_valid="no"
+    local source_temp=""
+    local expected_source=""
+    local current_source=""
     local telegraf_version=""
     local previous_package_version=""
     local current_package_version=""
     local update_telegraf=""
+    local telegraf_installed="no"
     local telegraf_restart_required="no"
 
     if command -v telegraf &> /dev/null; then
+        telegraf_installed="yes"
         telegraf_version=$(telegraf version 2>/dev/null | head -n1 || echo "unknown")
         log "SUCCESS" "Telegraf is already installed ($telegraf_version)"
 
@@ -1147,7 +1159,154 @@ install_telegraf() {
             log "WARN" "Unsupported Telegraf installation; skipping"
             return 0
         fi
+    fi
 
+    install -m 0755 -d /etc/apt/keyrings /etc/apt/sources.list.d
+
+    if [[ -e "$legacy_source_file" ]]; then
+        if [[ ! -f "$legacy_source_file" ]]; then
+            log "ERROR" "$legacy_source_file exists but is not a regular file"
+            return 1
+        fi
+
+        if rm -f "$legacy_source_file"; then
+            log "SUCCESS" "Removed legacy InfluxData repository"
+        else
+            log "ERROR" "Failed to remove legacy InfluxData repository"
+            return 1
+        fi
+    fi
+
+    if [[ -e "$key_file" && ! -f "$key_file" ]]; then
+        log "ERROR" "$key_file exists but is not a regular file"
+        return 1
+    fi
+
+    if [[ -f "$key_file" ]] &&
+       gpg --show-keys --with-fingerprint --with-colons "$key_file" 2>/dev/null |
+           awk -F: -v expected="$key_fingerprint" \
+               '$1 == "fpr" && $10 == expected { found = 1 } END { exit(found ? 0 : 1) }'; then
+        key_valid="yes"
+    fi
+
+    if [[ "$key_valid" == "no" ]]; then
+        if [[ -f "$key_file" ]]; then
+            log "WARN" "InfluxData GPG key is invalid; replacing..."
+        else
+            log "INFO" "Adding InfluxData GPG key..."
+        fi
+
+        key_download=$(mktemp /tmp/influxdata-archive.key.XXXXXX) || {
+            log "ERROR" "Failed to create temporary GPG key file"
+            return 1
+        }
+
+        if ! curl -fsSL \
+            --retry 5 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            -o "$key_download" \
+            https://repos.influxdata.com/influxdata-archive.key; then
+            log "ERROR" "Failed to download InfluxData GPG key"
+            rm -f "$key_download"
+            return 1
+        fi
+
+        if gpg --show-keys --with-fingerprint --with-colons "$key_download" 2>/dev/null |
+           awk -F: -v expected="$key_fingerprint" \
+               '$1 == "fpr" && $10 == expected { found = 1 } END { exit(found ? 0 : 1) }'; then
+            log "SUCCESS" "InfluxData GPG key verified"
+        else
+            log "ERROR" "GPG key fingerprint verification failed"
+            rm -f "$key_download"
+            return 1
+        fi
+
+        key_temp=$(mktemp /etc/apt/keyrings/influxdata-archive.gpg.XXXXXX) || {
+            log "ERROR" "Failed to create temporary keyring"
+            rm -f "$key_download"
+            return 1
+        }
+
+        if ! gpg --dearmor --yes --output "$key_temp" "$key_download" > /dev/null 2>&1; then
+            log "ERROR" "Failed to create InfluxData keyring"
+            rm -f "$key_download" "$key_temp"
+            return 1
+        fi
+
+        chmod 0644 "$key_temp"
+        if ! mv -f "$key_temp" "$key_file"; then
+            log "ERROR" "Failed to install InfluxData keyring"
+            rm -f "$key_download" "$key_temp"
+            return 1
+        fi
+
+        rm -f "$key_download"
+        log "SUCCESS" "InfluxData GPG key configured"
+    fi
+
+    expected_source=$(cat << EOF
+Types: deb
+URIs: https://repos.influxdata.com/debian
+Suites: stable
+Components: main
+Signed-By: $key_file
+EOF
+)
+
+    if [[ -f "$source_file" ]]; then
+        current_source=$(<"$source_file")
+    elif [[ -e "$source_file" ]]; then
+        log "ERROR" "$source_file exists but is not a regular file"
+        return 1
+    fi
+
+    if [[ "$current_source" == "$expected_source" ]]; then
+        log "INFO" "InfluxData repository is already up to date"
+    else
+        if [[ -f "$source_file" ]]; then
+            log "INFO" "Replacing outdated InfluxData repository..."
+        else
+            log "INFO" "Adding InfluxData repository..."
+        fi
+
+        source_temp=$(mktemp /etc/apt/sources.list.d/influxdata.sources.XXXXXX) || {
+            log "ERROR" "Failed to create temporary repository file"
+            return 1
+        }
+
+        if ! printf '%s\n' "$expected_source" > "$source_temp"; then
+            log "ERROR" "Failed to write InfluxData repository"
+            rm -f "$source_temp"
+            return 1
+        fi
+
+        chmod 0644 "$source_temp"
+        if ! mv -f "$source_temp" "$source_file"; then
+            log "ERROR" "Failed to install InfluxData repository"
+            rm -f "$source_temp"
+            return 1
+        fi
+
+        log "SUCCESS" "InfluxData repository configured"
+    fi
+
+    if [[ -e "$legacy_key_file" ]]; then
+        if [[ ! -f "$legacy_key_file" ]]; then
+            log "ERROR" "$legacy_key_file exists but is not a regular file"
+            return 1
+        fi
+
+        if rm -f "$legacy_key_file"; then
+            log "SUCCESS" "Removed legacy InfluxData GPG key"
+        else
+            log "ERROR" "Failed to remove legacy InfluxData GPG key"
+            return 1
+        fi
+    fi
+
+    if [[ "$telegraf_installed" == "yes" ]]; then
         while true; do
             read -r -p "Update Telegraf? [Y/n]: " update_telegraf
             case "$update_telegraf" in
@@ -1192,60 +1351,18 @@ install_telegraf() {
             log "INFO" "Telegraf update skipped"
         fi
     else
-        log "INFO" "Adding InfluxData repository..."
-        rm -f "$key_file"
-
-        if ! curl -fsSL \
-            --retry 5 \
-            --retry-delay 2 \
-            --retry-all-errors \
-            --connect-timeout 15 \
-            -o "$key_file" \
-            https://repos.influxdata.com/influxdata-archive.key; then
-            log "ERROR" "Failed to download InfluxData GPG key"
+        log "INFO" "Updating package list..."
+        apt-get update > /dev/null 2>&1 || {
+            log "ERROR" "Failed to update package list"
             return 1
-        fi
-
-        if gpg --show-keys --with-fingerprint --with-colons "$key_file" 2>&1 \
-           | grep '^fpr:' | grep -q '24C975CBA61A024EE1B631787C3D57159FC2F927'; then
-            log "SUCCESS" "GPG key verified"
-        else
-            log "ERROR" "GPG key fingerprint verification failed"
-            rm -f "$key_file"
-            return 1
-        fi
-
-        if gpg --dearmor --yes \
-            --output /etc/apt/trusted.gpg.d/influxdata-archive.gpg \
-            "$key_file" > /dev/null 2>&1; then
-            log "SUCCESS" "GPG key added"
-        else
-            log "ERROR" "Failed to add GPG key"
-            rm -f "$key_file"
-            return 1
-        fi
-
-        tee /etc/apt/sources.list.d/influxdata.sources > /dev/null << EOF
-Types: deb
-URIs: https://repos.influxdata.com/debian
-Suites: stable
-Components: main
-Signed-By: /etc/apt/trusted.gpg.d/influxdata-archive.gpg
-EOF
+        }
 
         log "INFO" "Installing Telegraf..."
-        if ! apt-get update > /dev/null 2>&1 || \
-           ! apt-get install -y telegraf > /dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y telegraf > /dev/null 2>&1 || {
             log "ERROR" "Failed to install Telegraf"
-            rm -f "$key_file"
             return 1
-        fi
+        }
 
-        mkdir -p /var/log/telegraf
-        touch /var/log/telegraf/telegraf.log
-        chown telegraf:telegraf /var/log/telegraf/telegraf.log
-        chown telegraf:telegraf /var/log/telegraf
-        rm -f "$key_file"
         log "SUCCESS" "Telegraf installed"
     fi
 
