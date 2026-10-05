@@ -21,12 +21,19 @@ sudo bash debiankit.sh
 菜单保留原来的 `01–08`、`99. Install All`、`00. Exit` 和 `reset`，并追加：
 
 ```text
-09. Reinstall Debian 13
-10. Reinstall Windows 10 IoT Enterprise LTSC 2021 (x64)
-11. Cancel Pending Reinstallation
+09. Reinstall
 ```
 
-基础包初始化只在选择 Debian 配置功能时执行；查看菜单、退出及进入重装不会触发该初始化。选择 `09` 或 `10` 后会选择系统语言，直接回车默认美国英文。`99. Install All` 仍运行原有配置组件；检测到待执行重装时，会提醒其清盘影响并跳过普通重启询问。
+进入 Reinstall 后再选择系统，执行后返回该子菜单，`00` 返回主菜单：
+
+```text
+01. Debian 13
+02. Windows 10 IoT Enterprise LTSC 2021 (x64)
+99. Cancel Pending Reinstallation
+00. Back to Main Menu
+```
+
+基础包初始化只在选择 Debian 配置功能时执行；查看菜单、退出及进入重装不会触发该初始化。选定系统后选择语言，直接回车默认美国英文。主菜单 `99. Install All` 仍运行原有配置组件；检测到待执行重装时，会提醒其清盘影响并跳过普通重启询问。
 
 可用命令行子命令调用同一套模块：
 
@@ -47,7 +54,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/planet756/Shell/mai
 
 ## 独立系统重装脚本
 
-重装逻辑位于 `modules/reinstall.sh`，通过统一入口 `debiankit.sh` 的 `09–11` 选项或 `reinstall` 子命令调用。系统检测、安装配置生成、引导配置、重装及取消流程均由本项目实现。目前提供两个预设：
+重装逻辑位于 `modules/reinstall.sh`，通过统一入口 `debiankit.sh` 的 `09. Reinstall` 子菜单或 `reinstall` 子命令调用。系统检测、安装配置生成、引导配置、重装及取消流程均由本项目实现。目前提供两个预设：
 
 | 预设 | 系统 | 安装方式 |
 | --- | --- | --- |
@@ -72,7 +79,7 @@ sudo bash debiankit.sh reinstall windows10-iot-ltsc
 ### 实际流程
 
 1. 选择系统和语言，检查机器、GRUB、磁盘和 IPv4 网络。显示将清除的磁盘，以及静态地址（如果适用）。
-2. 输入 `REINSTALL debian13` 或 `REINSTALL windows10-iot-ltsc` 确认，再输入至少 12 个字符的登录密码。Debian 使用 `root`；Windows 使用内置管理员账号，美国英文下名称为 `Administrator`，其他语言的显示名称可能不同。
+2. 核对显示的目标系统、磁盘及“手动重启后清除全部分区”提示，统一输入 `REINSTALL` 确认，直接回车取消。确认后再输入至少 12 个字符的登录密码。Debian 使用 `root`；Windows 使用内置管理员账号，美国英文下名称为 `Administrator`，其他语言的显示名称可能不同。
 3. 获取安装介质，生成本地安装配置及 initramfs，添加一次性 GRUB 启动项。这里已经修改当前系统的引导配置，但尚未清盘。
 4. 手动执行 `sudo reboot`，开始安装。**目标磁盘全部分区和数据将被清除。**
 
@@ -111,18 +118,12 @@ sudo bash debiankit.sh reinstall windows10-iot-ltsc \
 
 未指定 `--lang` 时，交互式重装会显示可用语言；直接回车默认 `en-us`，`00` 取消。指定 `--lang` 时跳过语言询问。`--dry-run` 不询问语言，默认展示美国英文。
 
-Debian 保留以下 8 种语言。当前 NTriver 和公开索引只确认了美国英文的 IoT LTSC 2021 原版，因此 Windows 默认下载仅提供美国英文；其他语言需提供包含该语言的 IoT ISO 地址和 `--iso-sha256`，此时语言菜单会开放对应选择。
+语言只保留 English 和简体中文。当前 NTriver 和公开索引只确认了美国英文的 IoT LTSC 2021 原版，因此 Windows 默认下载仅提供 English；简体中文需提供包含该语言的 IoT ISO 地址和 `--iso-sha256`，此时语言菜单会开放对应选择。
 
 | 编号 | 参数 | 语言 |
 | --- | --- | --- |
-| 01 | `en-us` | 美国英文（默认） |
+| 01 | `en-us` | English，美国英文（默认） |
 | 02 | `zh-cn` | 简体中文 |
-| 03 | `zh-tw` | 繁体中文 |
-| 04 | `ja-jp` | 日语 |
-| 05 | `ko-kr` | 韩语 |
-| 06 | `de-de` | 德语 |
-| 07 | `fr-fr` | 法语 |
-| 08 | `es-es` | 西班牙语 |
 
 ```bash
 bash debiankit.sh reinstall --languages

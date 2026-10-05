@@ -78,9 +78,7 @@ show_menu() {
         '06. Install Komari Agent (Non-Root)' \
         '07. Install Node.js (Official Binary)' \
         '08. Install Go (Official Binary)' \
-        '09. Reinstall Debian 13' \
-        '10. Reinstall Windows 10 IoT Enterprise LTSC 2021 (x64)' \
-        '11. Cancel Pending Reinstallation' \
+        '09. Reinstall' \
         '' \
         '99. Install All' \
         '00. Exit'
@@ -105,8 +103,8 @@ Debian actions: sources, user, bbr, docker, telegraf, komari, nodejs, go, all,
                 reset-init
 Reinstall presets: debian13, windows10-iot-ltsc
 Run bash debiankit.sh reinstall --help for reinstallation options.
-Menu option 99 runs the original setup components. Reinstallation is selected
-separately with 09/10 and still requires its disk-erasure confirmation.
+Menu option 09 opens Reinstall: choose a system, cancel pending installation,
+or return to the main menu. Option 99 runs the original setup components.
 EOF
 }
 
@@ -122,6 +120,55 @@ run_module() {
     bash "$script" "$@"
 }
 
+reinstall_menu() {
+    local catalog id label choice index selected
+    local -a presets=() labels=()
+    if ! catalog=$(run_module reinstall --list); then
+        log ERROR 'Cannot load reinstallation presets.'
+        return 1
+    fi
+    while read -r id label; do
+        [[ -n "$id" && -n "$label" ]] || continue
+        presets+=("$id")
+        labels+=("$label")
+    done <<< "$catalog"
+    (( ${#presets[@]} > 0 && ${#presets[@]} < 99 )) || {
+        log ERROR 'No usable reinstallation presets were found.'
+        return 1
+    }
+    while true; do
+        if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb ]]; then clear; fi
+        printf '%b\n' "${BLUE}======================================${NC}"
+        printf '%b\n' "${GREEN}              Reinstall${NC}"
+        printf '%b\n' "${BLUE}======================================${NC}"
+        for index in "${!presets[@]}"; do
+            printf '%02d. %s\n' "$((index + 1))" "${labels[index]}"
+        done
+        printf '%s\n' '' '99. Cancel Pending Reinstallation' '00. Back to Main Menu'
+        printf '%b\n' "${BLUE}======================================${NC}"
+        if ! read -r -p 'Select option [00-99]: ' choice; then
+            entry_error 'Interactive input is unavailable.'
+            return 1
+        fi
+        case "$choice" in
+            0|00) return 0 ;;
+            99) selected=reset ;;
+            *)
+                if [[ ! "$choice" =~ ^[0-9]{1,2}$ ]] ||
+                   (( 10#$choice < 1 || 10#$choice > ${#presets[@]} )); then
+                    log ERROR 'Invalid option. Select a listed number.'
+                    continue
+                fi
+                selected="${presets[10#$choice - 1]}"
+                ;;
+        esac
+        if ! run_module reinstall "$selected"; then
+            log WARN 'The selected action did not complete. Review its output before continuing.'
+        fi
+        pause || return 0
+    done
+}
+
 offer_setup_reboot() {
     local status answer
     run_module reinstall --pending
@@ -129,7 +176,7 @@ offer_setup_reboot() {
     case "$status" in
         0)
             log WARN 'Reinstallation is pending. Rebooting will erase the target disk and start installation.'
-            log INFO 'Review the reinstallation output, or cancel it with option 11 before rebooting.'
+            log INFO 'Review the reinstallation output, or open Reinstall and select 99 to cancel before rebooting.'
             return 0
             ;;
         1) ;;
@@ -155,9 +202,7 @@ dispatch_choice() {
         06) run_module debian komari ;;
         07) run_module debian nodejs ;;
         08) run_module debian go ;;
-        09) run_module reinstall debian13 ;;
-        10) run_module reinstall windows10-iot-ltsc ;;
-        11) run_module reinstall reset ;;
+        09) reinstall_menu ;;
         reset) run_module debian reset-init ;;
         99)
             if ! run_module debian all; then return 1; fi
@@ -180,6 +225,11 @@ main() {
             local module="$1"
             shift
             load_common || return 1
+            if [[ "$module" == reinstall && $# -eq 0 ]]; then
+                check_root
+                reinstall_menu
+                return $?
+            fi
             run_module "$module" "$@"
             return $?
             ;;
@@ -203,7 +253,7 @@ main() {
         if ! dispatch_choice "$choice"; then
             log WARN 'The selected action did not complete. Review its output before continuing.'
         fi
-        pause || return 0
+        if [[ "$choice" != 09 ]]; then pause || return 0; fi
     done
 }
 

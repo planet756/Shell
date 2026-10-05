@@ -15,21 +15,15 @@ readonly ENTRY_ID='standalone-reinstall'
 # id|name|Debian locale|Debian keyboard|Windows language|Windows input|ISO|SHA-256
 # Published Microsoft media hashes: https://awuctl.github.io/mvs/
 readonly -a OS_LANGUAGES=(
-    'en-us|English (United States)|en_US.UTF-8|us|en-US|0409:00000409|en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso|a0334f31ea7a3e6932b9ad7206608248f0bd40698bfb8fc65f14fc5e4976c160'
+    'en-us|English|en_US.UTF-8|us|en-US|0409:00000409|en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso|a0334f31ea7a3e6932b9ad7206608248f0bd40698bfb8fc65f14fc5e4976c160'
     'zh-cn|简体中文|zh_CN.UTF-8|us|zh-CN|0804:00000804||'
-    'zh-tw|繁體中文|zh_TW.UTF-8|us|zh-TW|0404:00000404||'
-    'ja-jp|日本語|ja_JP.UTF-8|jp|ja-JP|0411:00000411||'
-    'ko-kr|한국어|ko_KR.UTF-8|kr|ko-KR|0412:00000412||'
-    'de-de|Deutsch|de_DE.UTF-8|de|de-DE|0407:00000407||'
-    'fr-fr|Français|fr_FR.UTF-8|fr|fr-FR|040c:0000040c||'
-    'es-es|Español|es_ES.UTF-8|es|es-ES|0c0a:0000040a||'
 )
 readonly DEBIAN_MIRROR='https://deb.debian.org/debian'
 readonly ALPINE_BASE='https://dl-cdn.alpinelinux.org/alpine/v3.22'
 readonly VIRTIO_BASE='https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio'
 
 TARGET='' LABEL='' INSTALLER='' RELEASE='' LANGUAGE='en-US'
-REQUESTED_LANGUAGE='' LANGUAGE_LABEL='English (United States)'
+REQUESTED_LANGUAGE='' LANGUAGE_LABEL='English'
 DEBIAN_LOCALE=en_US.UTF-8 KEYMAP=us INPUT_LOCALE=0409:00000409
 WINDOWS_FILENAME='en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso'
 WINDOWS_SHA256='a0334f31ea7a3e6932b9ad7206608248f0bd40698bfb8fc65f14fc5e4976c160'
@@ -1114,13 +1108,16 @@ main() {
         fail 'Another one-shot boot is already pending; clear it before preparing this installation.'
     fi
     [[ ! -e "$GRUB_FRAGMENT" && ! -e "$STATE_DIR" && ! -e "$BOOT_DIR" ]] || fail 'An installation state already exists; run reset before preparing again.'
-    printf '\nTarget disk: %s (partition-table ID %s)\n' "$DISK" "$DISK_PTUUID"
+    printf '\nTarget system: %s\n' "$LABEL"
+    printf 'Target disk: %s (partition-table ID %s)\n' "$DISK" "$DISK_PTUUID"
     printf 'Network: %s; interface MAC %s\n' "$NETWORK_MODE" "$MAC"
     [[ "$NETWORK_MODE" != static ]] || printf 'IPv4: %s; gateway %s; DNS %s\n' "$ADDRESS" "$GATEWAY" "$DNS"
-    printf 'WARNING: After reboot, ALL partitions on the selected disk will be erased.\n'
+    printf '\nPreparation will update the boot configuration.\n'
+    printf 'Installation starts after a manual reboot.\n'
+    printf 'WARNING: Installation will erase ALL partitions and data on %s.\n' "$DISK"
     local answer
-    read -r -p "Type REINSTALL $TARGET to prepare: " answer || return 0
-    [[ "$answer" == "REINSTALL $TARGET" ]] || { printf 'Cancelled.\n'; return; }
+    read -r -p 'Type REINSTALL to prepare, or press Enter to cancel: ' answer || return 0
+    [[ "$answer" == REINSTALL ]] || { printf 'Cancelled.\n'; return 0; }
     read_password
     WORK_DIR="$STATE_DIR/work"
     PREPARING=yes
