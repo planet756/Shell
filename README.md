@@ -67,9 +67,10 @@ bash debiankit.sh reinstall --help
 - Windows 默认从第三方站点 [NTriver](https://ntriver.org/download-windows-ltsc) 获取英文 ISO，校验完整文件；自备 ISO 用 `--url` 或 `--iso`，其他语言还需提供 `--iso-sha256`。
 - 手动密码只需两次一致；密码提示直接回车生成 20 位随机密码，准备成功后在终端显示一次，请保存。
 - 默认保留当前系统的 hostname，可用 `--hostname` 修改；Windows 名称不兼容时需自行指定，最长 15 字符。
-- Debian 安装进度可通过 VNC／串口、SSH 和网页日志查看。SSH 使用本次重装的新密码或指定公钥；准备完成时会显示入口，网页默认端口 `8080`，可用 `--web-port` 修改。网络入口在安装器联网后可用，网页日志服务只在安装期间运行。
+- Debian 首次启动按 MAC 匹配实际网卡并配置网络，成功后清理临时服务；指定 `--ssh-key` 后，安装器与新 Debian 系统的 SSH 均使用公钥认证。
+- Debian 安装进度可通过 VNC／串口、SSH 和网页日志查看。SSH 使用本次重装的新密码或指定公钥，登录后自动显示与 VNC 相同的实时安装界面；按 `Ctrl+A` 再按 `D` 返回命令行，安装继续。网页默认端口 `8080`，可用 `--web-port` 修改。网络入口在安装器联网后可用，网页日志服务只在安装期间运行。
 - 输入 `REINSTALL` 准备安装，准备完成后手动重启；重启前可通过重装子菜单 `99` 或上述取消命令取消，需输入 `RESET` 确认。
 
-重装需要 x86_64 Linux、GRUB、单网卡 IPv4，Secure Boot 关闭；不支持 WSL 或容器。
+重装需要 x86_64 Linux、GRUB、单网卡 IPv4，Secure Boot 关闭；不支持 WSL 或容器。Windows 使用 BIOS 时，目标磁盘不能超过 2 TiB，更大磁盘需使用 UEFI。
 
 **重启进入安装后，将清除目标磁盘的全部分区和数据，请提前备份。**

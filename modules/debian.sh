@@ -144,7 +144,8 @@ init_user() {
     if usermod -aG sudo "$username" 2>/dev/null; then
         log "SUCCESS" "User '$username' added to sudo group"
     else
-        log "WARN" "Failed to add user to sudo group (may already be a member)"
+        log "ERROR" "Failed to add user to sudo group"
+        return 1
     fi
 
     # Show user info
@@ -506,6 +507,82 @@ EOF
 }
 
 # Install Node.js from official binary
+install_node_archive() (
+    # Keep changes to Node-owned paths in one transaction; other /usr/local files stay intact.
+    set -euo pipefail
+    umask 022
+    local archive="$1" archive_dir="$2" install_prefix="$3" expected_version="$4"
+    local transaction='' committed=no relative source target backup index rollback_failed=no actual_version
+    local -a installed=() originals=() paths=()
+    mkdir -p "$install_prefix" || return 1
+    transaction=$(mktemp -d "$install_prefix/.node-install.XXXXXX") || return 1
+    # shellcheck disable=SC2329 # Invoked by the EXIT trap.
+    rollback_node_install() {
+        local status=$?
+        trap - EXIT INT TERM
+        if [[ "$committed" != yes ]]; then
+            for ((index=${#installed[@]}-1; index>=0; index--)); do
+                rm -rf -- "${install_prefix:?}/${installed[index]:?}" || rollback_failed=yes
+            done
+            for ((index=${#originals[@]}-1; index>=0; index--)); do
+                relative="${originals[index]}"
+                backup="$transaction/backup/$relative"
+                if [[ -e "$backup" || -L "$backup" ]]; then
+                    if ! mv -T -- "$backup" "$install_prefix/$relative"; then rollback_failed=yes; fi
+                fi
+            done
+        fi
+        if [[ "$rollback_failed" == yes ]]; then
+            log ERROR "Node.js rollback could not finish. Backups retained at $transaction/backup"
+        else
+            rm -rf -- "$transaction" || log WARN "Could not remove Node.js staging files at $transaction"
+        fi
+        return "$status"
+    }
+    trap rollback_node_install EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    mkdir -p "$transaction/new" "$transaction/backup" || return 1
+    tar -xJf "$archive" --no-same-owner --strip-components=1 -C "$transaction/new" \
+        "$archive_dir/bin" "$archive_dir/lib" "$archive_dir/include" "$archive_dir/share" || return 1
+    [[ -x "$transaction/new/bin/node" && -x "$transaction/new/bin/npm" && -x "$transaction/new/bin/npx" ]] || {
+        log ERROR 'The extracted Node.js installation is incomplete.'; return 1;
+    }
+    actual_version=$("$transaction/new/bin/node" --version) || return 1
+    [[ "$actual_version" == "$expected_version" ]] || {
+        log ERROR 'The extracted Node.js version does not match the requested version.'; return 1;
+    }
+    PATH="$transaction/new/bin:$PATH" "$transaction/new/bin/npm" --version >/dev/null || return 1
+    PATH="$transaction/new/bin:$PATH" "$transaction/new/bin/npx" --version >/dev/null || return 1
+    # Recurse into shared directories; replace only each package's own files/directories.
+    find "$transaction/new" -mindepth 1 \
+        \( -path "$transaction/new/bin" -o -path "$transaction/new/lib" -o -path "$transaction/new/lib/node_modules" \
+        -o -path "$transaction/new/include" -o -path "$transaction/new/share" -o -path "$transaction/new/share/doc" \
+        -o -path "$transaction/new/share/man" -o -path "$transaction/new/share/man/man[1-9]" \
+        -o -path "$transaction/new/share/systemtap" -o -path "$transaction/new/share/systemtap/tapset" \) \
+        -type d -o -print0 -prune > "$transaction/paths" || return 1
+    mapfile -d '' -t paths < "$transaction/paths" || return 1
+    for source in "${paths[@]}"; do
+        relative="${source#"$transaction/new/"}"
+        target="$install_prefix/$relative"
+        backup="$transaction/backup/$relative"
+        mkdir -p -- "${target%/*}" "${backup%/*}" || return 1
+        if [[ -e "$target" || -L "$target" ]]; then
+            originals+=("$relative")
+            mv -T -- "$target" "$backup" || return 1
+        fi
+        installed+=("$relative")
+        mv -T -- "$source" "$target" || return 1
+    done
+    actual_version=$("$install_prefix/bin/node" --version) || return 1
+    [[ "$actual_version" == "$expected_version" ]] || {
+        log ERROR 'Installed Node.js validation failed; restoring the previous installation.'; return 1;
+    }
+    PATH="$install_prefix/bin:$PATH" "$install_prefix/bin/npm" --version >/dev/null || return 1
+    PATH="$install_prefix/bin:$PATH" "$install_prefix/bin/npx" --version >/dev/null || return 1
+    committed=yes
+)
+
 install_nodejs() {
     log "INFO" "Installing Node.js from official binary..."
 
@@ -630,20 +707,7 @@ install_nodejs() {
         fi
         log "SUCCESS" "Node.js checksum verified"
 
-        mkdir -p \
-            "$install_prefix/bin" \
-            "$install_prefix/lib" \
-            "$install_prefix/include" \
-            "$install_prefix/share"
-
-        if ! tar -xJf "${temp_dir}/${archive_name}" \
-            --no-same-owner \
-            --strip-components=1 \
-            -C "$install_prefix" \
-            "${archive_dir}/bin" \
-            "${archive_dir}/lib" \
-            "${archive_dir}/include" \
-            "${archive_dir}/share"; then
+        if ! install_node_archive "${temp_dir}/${archive_name}" "$archive_dir" "$install_prefix" "$node_version"; then
             log "ERROR" "Failed to install Node.js to $install_prefix"
             rm -rf "$temp_dir"
             return 1

@@ -12,6 +12,7 @@ readonly STATE_DIR='/var/lib/standalone-reinstall'
 readonly BOOT_DIR='/boot/standalone-reinstall'
 readonly GRUB_FRAGMENT='/etc/grub.d/99_standalone_reinstall'
 readonly ENTRY_ID='standalone-reinstall'
+readonly LOCK_FILE='/run/standalone-reinstall.lock'
 # id|name|Debian locale|Debian keyboard|Windows language|Windows input|ISO|SHA-256
 # Published Microsoft media hashes: https://awuctl.github.io/mvs/
 readonly -a OS_LANGUAGES=(
@@ -33,8 +34,16 @@ HOSTNAME_VALUE='' SSH_PORT=22 RDP_PORT=3389 WEB_PORT=8080 WEB_PORT_SET=no WEB_TO
 CUSTOM_ISO_SHA256='' ISO_SOURCE=ntriver WINDOWS_ISO_OPTION=no
 PASSWORD_HASH='' WINDOWS_PASSWORD='' GENERATED_PASSWORD='' VIRTIO=no WORK_DIR='' PREPARING=no
 GRUB_CONFIG='' GRUB_ENV='' GRUB_MKCONFIG='' GRUB_REBOOT='' GRUB_EDITENV='' GRUB_PROBE=''
+REINSTALL_LOCK_FD=''
 
 fail() { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
+
+acquire_reinstall_lock() {
+    [[ -z "$REINSTALL_LOCK_FD" ]] || return 0
+    [[ -d "${LOCK_FILE%/*}" ]] || install -d -m 0755 "${LOCK_FILE%/*}"
+    exec {REINSTALL_LOCK_FD}> "$LOCK_FILE" || fail 'Cannot open the reinstallation lock.'
+    flock -n "$REINSTALL_LOCK_FD" || fail 'Another reinstallation preparation or cancellation is running.'
+}
 
 ui_section() {
     local color='' reset=''
@@ -280,6 +289,8 @@ parse_args() {
         shift
     done
     case "$NETWORK_MODE" in auto|dhcp|static) ;; *) fail 'Invalid network mode.' ;; esac
+    # Explicit static settings must not be discarded by automatic DHCP detection.
+    if [[ "$NETWORK_MODE" == auto && ( -n "$ADDRESS" || -n "$GATEWAY" ) ]]; then NETWORK_MODE=static; fi
     if ! valid_port "$SSH_PORT" || ! valid_port "$RDP_PORT" || ! valid_port "$WEB_PORT"; then fail 'Port must be between 1 and 65535.'; fi
     if [[ -n "$ISO_URL" ]]; then
         [[ "$ISO_URL" == https://* && "$ISO_URL" != *[$'\r\n']* ]] || fail 'ISO must be an HTTPS URL.'
@@ -290,6 +301,9 @@ parse_args() {
     fi
     if [[ -n "$SSH_KEY_FILE" ]]; then
         [[ -f "$SSH_KEY_FILE" ]] || fail 'SSH public key file does not exist.'
+        local key_type
+        key_type=$(awk 'NF && $1 !~ /^#/ {print $1; exit}' "$SSH_KEY_FILE")
+        case "$key_type" in ssh-*|ecdsa-*|sk-*) ;; *) fail '--ssh-key requires an OpenSSH public key (.pub), not a private key.' ;; esac
         ssh-keygen -l -f "$SSH_KEY_FILE" >/dev/null 2>&1 || fail 'Invalid OpenSSH public key file.'
     fi
 }
@@ -362,7 +376,9 @@ show_ready() {
         printf '    SSH: ssh -p %s root@%s\n' "$SSH_PORT" "$host"
         if [[ -n "$SSH_KEY_FILE" ]]; then printf '    SSH login: your specified SSH key\n'
         else printf '    SSH login: the NEW password set for this reinstallation\n'; fi
-        printf '    Installer: TERM=screen screen -x reinstall -p 1 (Ctrl+A, D to detach)\n'
+        printf '    SSH opens the same live installer as VNC automatically.\n'
+        printf '    Shell: Ctrl+A, then D (installation continues)\n'
+        printf '    Reattach: TERM=screen screen -x reinstall -p 1\n'
         printf '    Logs: /reinstall/view-logs.sh\n'
         if [[ -t 0 && -n "$WEB_TOKEN" ]]; then
             printf '    Web logs (private link): http://%s:%s/%s\n' "$host" "$WEB_PORT" "$WEB_TOKEN" > /dev/tty ||
@@ -412,7 +428,7 @@ check_runtime() {
     fi
     [[ -t 0 ]] || fail 'An interactive terminal is required; do not pipe the script to bash.'
     local command_name
-    for command_name in curl python3 cpio gzip openssl ip lsblk blkid findmnt install sha256sum ssh-keygen; do
+    for command_name in curl python3 cpio gzip openssl ip lsblk blkid findmnt install sha256sum ssh-keygen flock; do
         command -v "$command_name" >/dev/null || fail "Missing required command: $command_name"
     done
     if [[ -d /sys/firmware/efi ]]; then
@@ -451,6 +467,9 @@ detect_disk() {
     DISK_PTUUID=$(blkid -s PTUUID -o value "$DISK")
     [[ "$DISK_PTUUID" =~ ^[a-fA-F0-9-]+$ ]] || fail 'Target disk needs an existing partition-table ID.'
     DISK_BYTES=$(lsblk -bdnro SIZE "$DISK")
+    if [[ "$INSTALLER" == windows && "$BOOT_MODE" == bios ]] && (( DISK_BYTES > 2199023255552 )); then
+        fail 'Windows BIOS installation supports disks up to 2 TiB. Use UEFI for larger disks.'
+    fi
     local memory_kib minimum_disk minimum_memory
     memory_kib=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
     if [[ "$INSTALLER" == windows ]]; then minimum_disk=51539607552; minimum_memory=2097152
@@ -460,7 +479,7 @@ detect_disk() {
 }
 
 detect_network() {
-    local route current_address current_gateway current_dns
+    local route route_source address_line current_address current_gateway current_dns
     route=$(ip -4 route get 1.1.1.1)
     NIC=$(awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' <<< "$route")
     [[ -n "$NIC" && -r "/sys/class/net/$NIC/address" ]] || fail 'No usable IPv4 interface found.'
@@ -471,16 +490,27 @@ detect_network() {
     done
     (( physical_count == 1 )) || fail 'Multiple physical network adapters are not implemented in this version.'
     MAC=$(cat "/sys/class/net/$NIC/address")
-    current_address=$(ip -4 -o addr show dev "$NIC" scope global | awk 'NR==1 {print $4}')
-    current_gateway=$(ip -4 route show default dev "$NIC" | awk '/via/ {print $3; exit}')
+    [[ "$MAC" =~ ^([a-fA-F0-9]{2}:){5}[a-fA-F0-9]{2}$ ]] || fail 'Cannot determine the target network adapter MAC address.'
+    MAC="${MAC,,}"
+    route_source=$(awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' <<< "$route")
+    address_line=$(ip -4 -o addr show dev "$NIC" scope global | awk -v source="$route_source" '
+        NR==1 {fallback=$0} {split($4, ip, "/"); if (ip[1]==source) {print; found=1; exit}} END {if (!found) print fallback}')
+    current_address=$(awk '{print $4}' <<< "$address_line")
+    current_gateway=$(awk '{for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}' <<< "$route")
+    [[ -n "$current_gateway" ]] || current_gateway=$(ip -4 route show default dev "$NIC" | awk '/via/ {print $3; exit}')
     ADDRESS="${ADDRESS:-$current_address}"; GATEWAY="${GATEWAY:-$current_gateway}"
     if [[ "$NETWORK_MODE" == auto ]]; then
-        if ip -4 -o addr show dev "$NIC" | grep -qw dynamic; then NETWORK_MODE=dhcp
+        if grep -qw dynamic <<< "$address_line"; then NETWORK_MODE=dhcp
         else NETWORK_MODE=static; fi
     fi
     current_dns=$(awk '$1=="nameserver" && $2 !~ /^127\./ && $2 !~ /:/ {print $2}' /etc/resolv.conf | paste -sd,)
     if [[ -z "$current_dns" ]] && command -v resolvectl >/dev/null; then
         current_dns=$(resolvectl dns "$NIC" 2>/dev/null | sed 's/^[^:]*: //' | tr ' ' ',')
+    fi
+    # Ignore IPv6 and local resolver stubs; this version configures IPv4 only.
+    current_dns=$(filter_ipv4_dns "$current_dns")
+    if [[ -z "$current_dns" && -r /run/systemd/resolve/resolv.conf ]]; then
+        current_dns=$(filter_ipv4_dns "$(awk '$1=="nameserver" {print $2}' /run/systemd/resolve/resolv.conf | paste -sd,)")
     fi
     DNS="${DNS:-${current_dns:-1.1.1.1,8.8.8.8}}"
     validate_network
@@ -496,6 +526,21 @@ detect_network() {
     fi
 }
 
+filter_ipv4_dns() {
+    python3 - "$1" <<'PY'
+import ipaddress, re, sys
+resolvers = []
+for value in re.split(r'[,\s]+', sys.argv[1]):
+    try:
+        address = ipaddress.IPv4Address(value)
+        if not (address.is_loopback or address.is_unspecified or address.is_multicast) and str(address) not in resolvers:
+            resolvers.append(str(address))
+    except ipaddress.AddressValueError:
+        pass
+print(','.join(resolvers))
+PY
+}
+
 validate_network() {
     NETMASK=$(python3 - "$ADDRESS" "$GATEWAY" "$DNS" "$NETWORK_MODE" <<'PY'
 import ipaddress, sys
@@ -506,6 +551,8 @@ try:
         gw = ipaddress.IPv4Address(sys.argv[2])
         if gw not in addr.network or addr.network.prefixlen >= 31:
             raise ValueError('Static /31, /32 or gateway outside the subnet is not yet supported.')
+        if addr.ip in (addr.network.network_address, addr.network.broadcast_address) or gw in (addr.network.network_address, addr.network.broadcast_address) or addr.ip == gw:
+            raise ValueError('Static address and gateway must be distinct usable host addresses.')
     print(addr.netmask)
 except ValueError as error:
     print(str(error), file=sys.stderr); sys.exit(1)
@@ -839,16 +886,52 @@ case "$path" in
     "/$WEB_TOKEN"|"/$WEB_TOKEN/")
         response '200 OK' 'text/html; charset=utf-8'
         cat <<'HTML'
-<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Debian installation progress</title>
-<style>body{margin:2rem auto;max-width:1100px;padding:0 1rem;background:#111827;color:#e5e7eb;font:16px system-ui}header{display:flex;justify-content:space-between;gap:1rem;align-items:center}h1{font-size:1.4rem}#status{color:#93c5fd}pre{background:#030712;border:1px solid #374151;border-radius:8px;padding:1rem;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}p{color:#9ca3af}</style>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}
+body{margin:0;height:100vh;height:100dvh;overflow:hidden;padding:24px;display:flex;align-items:center;justify-content:center;background:#111827;color:#e5e7eb;font:16px system-ui}
+main{width:100%;max-width:1100px;height:100%;max-height:860px;min-height:0;display:flex;flex-direction:column}
+header{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:16px;flex-shrink:0}
+h1{font-size:1.4rem;margin:0}#status{color:#93c5fd;font-size:13px}
+.terminal{flex:1;min-height:0;display:flex;flex-direction:column;background:#030712;border:1px solid #374151;border-radius:10px;overflow:hidden}
+.terminal-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#1f2937;border-bottom:1px solid #374151;font-size:13px;flex-shrink:0}
+button{border:1px solid #4b5563;border-radius:6px;padding:5px 10px;background:#111827;color:#e5e7eb;font:inherit;cursor:pointer}
+button[aria-pressed="true"]{border-color:#2563eb;color:#93c5fd}button:focus-visible,pre:focus-visible{outline:2px solid #60a5fa;outline-offset:-2px}
+pre{flex:1;min-height:0;margin:0;padding:16px;overflow:auto;overflow-anchor:none;scrollbar-gutter:stable;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace}
+p{margin:12px 0 0;color:#9ca3af;font-size:13px;line-height:1.5;flex-shrink:0}
+@media(max-width:600px){body{padding:12px}header{margin-bottom:12px}h1{font-size:1.15rem}.terminal-bar,pre{padding:12px}}
+</style></head><body><main>
 <header><h1>Debian installation progress</h1><span id="status">Connecting...</span></header>
-<p>Updates every 2 seconds. Closing this page does not stop installation. An unreachable page can mean the server is rebooting; use VNC to confirm.</p>
-<pre id="log">Waiting for installer logs...</pre>
+<section class="terminal" aria-label="Installation terminal">
+<div class="terminal-bar"><span>Installer log</span><button id="follow" type="button" aria-pressed="true">Pause follow</button></div>
+<pre id="log" tabindex="0" aria-label="Live installer log" aria-live="off">Waiting for installer logs...</pre>
+</section>
+<p>Updates every 2 seconds. Scroll up to pause following; return to the bottom or select Follow latest to resume. A disconnected page may indicate a reboot; check VNC.</p>
+</main>
 <script>
-const base=location.pathname.replace(/\/$/,''),output=document.getElementById('log'),status=document.getElementById('status');
-async function update(){try{const response=await fetch(base+'/logs',{cache:'no-store'});if(!response.ok)throw Error();output.textContent=await response.text();status.textContent='Updated '+new Date().toLocaleTimeString();}catch{status.textContent='Connection lost - check VNC';}finally{setTimeout(update,2000);}}update();
-</script></html>
+const base=location.pathname.replace(/\/$/,''),output=document.getElementById('log'),status=document.getElementById('status'),follow=document.getElementById('follow');
+let following=true,expectedScrollTop=null;
+function setFollowing(value){following=value;follow.textContent=value?'Pause follow':'Follow latest';follow.setAttribute('aria-pressed',String(value));}
+function scrollLog(top){output.scrollTop=top;expectedScrollTop=output.scrollTop;}
+new ResizeObserver(()=>{if(following)scrollLog(output.scrollHeight);}).observe(output);
+follow.addEventListener('click',()=>{setFollowing(!following);if(following)scrollLog(output.scrollHeight);});
+output.addEventListener('scroll',()=>{
+    const programmatic=expectedScrollTop!==null&&Math.abs(output.scrollTop-expectedScrollTop)<1;
+    expectedScrollTop=null;
+    if(!programmatic)setFollowing(output.scrollHeight-output.clientHeight-output.scrollTop<24);
+},{passive:true});
+async function update(){
+    try{
+        const response=await fetch(base+'/logs',{cache:'no-store'});if(!response.ok)throw Error();
+        const text=await response.text();
+        if(output.textContent!==text){const top=output.scrollTop;output.textContent=text;scrollLog(following?output.scrollHeight:top);}
+        status.textContent='Updated '+new Date().toLocaleTimeString();
+    }catch{status.textContent='Connection lost - check VNC';}
+    finally{setTimeout(update,2000);}
+}
+update();
+</script></body></html>
 HTML
         ;;
     "/$WEB_TOKEN/logs")
@@ -883,6 +966,19 @@ until screen -ls 2>/dev/null | grep -q '\.reinstall[[:space:]]'; do
 done
 exec screen -x reinstall -p 1
 SH
+    install -d -m 0700 "$directory/root"
+    cat > "$directory/root/.profile" <<'SH'
+# Installer-only: attach interactive SSH logins to the existing VNC session.
+if [ -n "${SSH_TTY:-}" ] && [ -t 0 ] && [ -t 1 ]; then
+    printf '\nOpening the shared installer. Ctrl+A, then D returns to this shell.\n'
+    if ! TERM=screen /reinstall/console-session.sh; then
+        printf '\nCould not attach to the installer. Use VNC to check its status.\n'
+    fi
+    printf '\nInstaller shell. Installation continues in the shared session.\n'
+    printf '  Reattach: TERM=screen screen -x reinstall -p 1\n  Logs: /reinstall/view-logs.sh\n'
+fi
+SH
+    chmod 0600 "$directory/root/.profile"
     cat > "$directory/usr/sbin/reopen-console" <<'SH'
 #!/bin/sh
 # Start the official installer once, on a usable visual console when present.
@@ -962,9 +1058,10 @@ if [ -s /reinstall/authorized_keys ]; then
 fi
 cat > /etc/motd <<'MOTD'
 Reinstallation is in progress.
-  Installer: TERM=screen screen -x reinstall -p 1
-  Detach:    Ctrl+A, then D (installation continues)
-  Logs:      /reinstall/view-logs.sh
+  Interactive SSH opens the same live installer as VNC automatically.
+  Shell:    Ctrl+A, then D (installation continues)
+  Reattach: TERM=screen screen -x reinstall -p 1
+  Logs:     /reinstall/view-logs.sh
 MOTD
 if ! grep -q 'reinstall/console-session.sh' /etc/inittab; then
     primary=$(awk '{print $1}' /var/run/console-preferred 2>/dev/null || true)
@@ -994,19 +1091,130 @@ SH
 /reinstall/start-monitoring.sh >>/var/log/reinstall-monitor.log 2>&1 ||
     logger -t reinstall 'Monitoring startup failed; installation continues. Inspect /var/log/reinstall-monitor.log from VNC.'
 SH
+    cat > "$directory/usr/lib/debian-installer-startup.d/S38lowmemwarn" <<'SH'
+# Keep Debian's low-memory setup, without blocking automation on an informational note.
+if [ -e /var/lib/lowmem ]; then
+    anna-install lowmem
+    if [ -e /var/lib/lowmem_insufficient ]; then
+        lowmem_debconf lowmem/insufficient "$(cat /var/lib/lowmem_insufficient)"
+    else
+        logger -t reinstall 'Low-memory installation mode enabled; continuing automatically.'
+    fi
+fi
+SH
     chmod 0755 "$directory/reinstall/"*.sh "$directory/usr/lib/debian-installer-startup.d/S34reinstall-monitor"
     chmod 0755 "$directory/usr/sbin/reopen-console"
     chmod 0644 "$directory/usr/lib/debian-installer.d/S70menu"
+    chmod 0644 "$directory/usr/lib/debian-installer-startup.d/S38lowmemwarn"
+}
+
+write_debian_firstboot_network() {
+    local directory="$1"
+    cat > "$directory/reinstall/firstboot-network.conf" <<EOF
+MAC='$MAC'
+NETWORK_MODE='$NETWORK_MODE'
+ADDRESS='$ADDRESS'
+GATEWAY='$GATEWAY'
+DNS='$DNS'
+EOF
+    cat > "$directory/reinstall/configure-network.sh" <<'SH'
+#!/bin/sh
+# Local first-boot configuration: identify the NIC by MAC before networking starts.
+set -eu
+. /etc/debiankit-network.conf
+if command -v udevadm >/dev/null 2>&1; then udevadm settle --timeout=15 || true; fi
+attempt=0
+previous=''
+stable=0
+nic=''
+while [ "$attempt" -lt 60 ]; do
+    attempt=$((attempt + 1))
+    matches=0
+    candidate=''
+    for device in /sys/class/net/*; do
+        [ -r "$device/address" ] || continue
+        address=$(tr '[:upper:]' '[:lower:]' < "$device/address")
+        if [ "$address" = "$MAC" ]; then candidate=${device##*/}; matches=$((matches + 1)); fi
+    done
+    if [ "$matches" -gt 1 ]; then echo 'Network setup stopped: adapter MAC is not unique.' >&2; exit 1; fi
+    if [ "$matches" -eq 1 ] && [ "$candidate" = "$previous" ]; then stable=$((stable + 1)); else stable=0; fi
+    previous=$candidate
+    if [ "$stable" -ge 3 ]; then nic=$candidate; break; fi
+    sleep 1
+done
+[ -n "$nic" ] || { echo 'Network setup stopped: target adapter was not found or its name did not stabilize.' >&2; exit 1; }
+case "$nic" in ''|*[!a-zA-Z0-9_.:-]*) echo 'Unsupported network adapter name.' >&2; exit 1 ;; esac
+config=$(mktemp /etc/network/interfaces.XXXXXX)
+trap 'rm -f "$config"' EXIT
+{
+    printf 'source /etc/network/interfaces.d/*\n\nauto lo\niface lo inet loopback\n\nauto %s\n' "$nic"
+    if [ "$NETWORK_MODE" = static ]; then
+        printf 'iface %s inet static\n    address %s\n    gateway %s\n    dns-nameservers %s\n' "$nic" "$ADDRESS" "$GATEWAY" "$(printf '%s' "$DNS" | tr ',' ' ')"
+    elif [ "$NETWORK_MODE" = dhcp ]; then printf 'iface %s inet dhcp\n' "$nic"
+    else echo 'Unsupported network mode.' >&2; exit 1; fi
+} > "$config"
+chmod 0644 "$config"
+if [ -f /etc/network/interfaces ]; then cp -p /etc/network/interfaces /etc/network/interfaces.before-firstboot; fi
+mv -f "$config" /etc/network/interfaces
+if [ "$NETWORK_MODE" = static ]; then
+    # ifupdown alone does not apply dns-nameservers without resolvconf.
+    rm -f /etc/resolv.conf
+    for resolver in $(printf '%s' "$DNS" | tr ',' ' '); do printf 'nameserver %s\n' "$resolver"; done > /etc/resolv.conf
+    chmod 0644 /etc/resolv.conf
+fi
+rm -f /etc/debiankit-network.conf /usr/local/sbin/debiankit-network-setup
+rm -f /etc/systemd/system/debiankit-network-setup.service
+rm -f /etc/systemd/system/networking.service.requires/debiankit-network-setup.service
+printf 'Network configured for %s by MAC; temporary setup files removed.\n' "$nic"
+SH
+    cat > "$directory/reinstall/firstboot-network.service" <<'UNIT'
+[Unit]
+Description=Configure the installation network adapter by MAC
+DefaultDependencies=no
+Wants=systemd-udev-trigger.service
+After=local-fs.target systemd-udev-trigger.service
+Before=networking.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/debiankit-network-setup
+RemainAfterExit=yes
+TimeoutStartSec=90
+
+[Install]
+RequiredBy=networking.service
+UNIT
+    cat > "$directory/reinstall/finish-install.sh" <<'SH'
+#!/bin/sh
+set -eu
+for file in postinstall.sh firstboot-network.conf configure-network.sh firstboot-network.service; do
+    cp "/reinstall/$file" "/target/root/$file"
+done
+cp /reinstall/ssh-host-key /target/etc/ssh/ssh_host_ed25519_key
+cp /reinstall/ssh-host-key.pub /target/etc/ssh/ssh_host_ed25519_key.pub
+chmod 0600 /target/etc/ssh/ssh_host_ed25519_key
+chmod 0644 /target/etc/ssh/ssh_host_ed25519_key.pub
+in-target /bin/sh /root/postinstall.sh
+rm -f /target/root/postinstall.sh /target/root/firstboot-network.conf
+rm -f /target/root/configure-network.sh /target/root/firstboot-network.service
+logger -t reinstall 'SSH configuration verified. First-boot networking scheduled; finishing installation before reboot.'
+SH
+    chmod 0600 "$directory/reinstall/firstboot-network.conf"
+    chmod 0644 "$directory/reinstall/firstboot-network.service"
+    chmod 0700 "$directory/reinstall/configure-network.sh" "$directory/reinstall/finish-install.sh"
 }
 
 write_debian_payload() {
-    local directory="$1" key=''
+    local directory="$1" key='' password_authentication=yes encoded_key=''
     install -d -m 0700 "$directory/reinstall"
-    [[ -z "$SSH_KEY_FILE" ]] || key=$(cat "$SSH_KEY_FILE")
+    if [[ -n "$SSH_KEY_FILE" ]]; then
+        key=$(cat "$SSH_KEY_FILE")
+        password_authentication=no
+    fi
     cat > "$directory/preseed.cfg" <<EOF
 d-i debian-installer/locale string $DEBIAN_LOCALE
 d-i keyboard-configuration/xkb-keymap select $KEYMAP
-d-i netcfg/choose_interface select auto
+d-i netcfg/choose_interface select $MAC
 d-i netcfg/get_hostname string $HOSTNAME_VALUE
 d-i netcfg/hostname string $HOSTNAME_VALUE
 d-i netcfg/get_domain string local
@@ -1033,14 +1241,14 @@ d-i partman/choose_partition select finish
 d-i partman/confirm boolean true
 d-i partman/confirm_nooverwrite boolean true
 tasksel tasksel/first multiselect standard, ssh-server
-d-i pkgsel/include string openssh-server ca-certificates sudo
+d-i pkgsel/include string openssh-server ca-certificates sudo ifupdown isc-dhcp-client
 d-i pkgsel/upgrade select none
 popularity-contest popularity-contest/participate boolean false
 d-i grub-installer/only_debian boolean true
 d-i grub-installer/with_other_os boolean false
 d-i finish-install/reboot_in_progress note
 d-i partman/early_command string /bin/sh /reinstall/select-disk.sh
-d-i preseed/late_command string cp /reinstall/postinstall.sh /target/root/postinstall.sh && cp /reinstall/ssh-host-key /target/etc/ssh/ssh_host_ed25519_key && cp /reinstall/ssh-host-key.pub /target/etc/ssh/ssh_host_ed25519_key.pub && in-target /bin/sh /root/postinstall.sh && rm -f /target/root/postinstall.sh
+d-i preseed/late_command string /bin/sh /reinstall/finish-install.sh
 EOF
     if [[ "$NETWORK_MODE" == static ]]; then
         cat >> "$directory/preseed.cfg" <<EOF
@@ -1056,11 +1264,13 @@ EOF
 #!/bin/sh
 set -eu
 expected='$DISK_PTUUID'
+expected_bytes='$DISK_BYTES'
 matched=''
 count=0
 for disk in \$(list-devices disk); do
     id=\$(blkid -s PTUUID -o value "\$disk" 2>/dev/null || true)
-    if [ "\$id" = "\$expected" ]; then matched="\$disk"; count=\$((count + 1)); fi
+    sectors=\$(cat "/sys/class/block/\${disk##*/}/size" 2>/dev/null || true)
+    if [ "\$id" = "\$expected" ] && [ -n "\$sectors" ] && [ "\$((sectors * 512))" = "\$expected_bytes" ]; then matched="\$disk"; count=\$((count + 1)); fi
 done
 if [ "\$count" != 1 ]; then
     logger -t reinstall 'STOPPED: target disk identity could not be verified. No disk was selected.'
@@ -1080,15 +1290,25 @@ mkdir -p /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/99-reinstall.conf <<'SSH'
 Port $SSH_PORT
 PermitRootLogin yes
-PasswordAuthentication yes
+PasswordAuthentication $password_authentication
 SSH
+mkdir -p /usr/local/sbin /etc/systemd/system
+install -m 0600 /root/firstboot-network.conf /etc/debiankit-network.conf
+install -m 0700 /root/configure-network.sh /usr/local/sbin/debiankit-network-setup
+install -m 0644 /root/firstboot-network.service /etc/systemd/system/debiankit-network-setup.service
+systemctl enable debiankit-network-setup.service networking.service
+ssh-keygen -A
+install -d -m 0755 /run/sshd
+/usr/sbin/sshd -t
 systemctl enable ssh
 EOF
     if [[ -n "$key" ]]; then
         printf 'install -d -m 0700 /root/.ssh\n' >> "$directory/reinstall/postinstall.sh"
-        # A fixed quoted heredoc prevents shell interpolation of key comments.
-        printf "cat > /root/.ssh/authorized_keys <<'REINSTALL_PUBLIC_KEY'\n%s\nREINSTALL_PUBLIC_KEY\nchmod 0600 /root/.ssh/authorized_keys\n" "$key" >> "$directory/reinstall/postinstall.sh"
+        # Encode as data so multi-line key files cannot terminate a shell heredoc.
+        encoded_key=$(printf '%s\n' "$key" | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()).decode())')
+        printf "printf '%%s' '%s' | base64 -d > /root/.ssh/authorized_keys\nchmod 0600 /root/.ssh/authorized_keys\n" "$encoded_key" >> "$directory/reinstall/postinstall.sh"
     fi
+    write_debian_firstboot_network "$directory"
     chmod 0700 "$directory/reinstall/"*.sh
     write_debian_monitoring "$directory"
 }
@@ -1207,13 +1427,19 @@ for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (
 if not defined media goto failed
 set /p expected=<"%media%\reinstall.tag"
 set "diskid="
-for /l %%D in (0,1,31) do (
-  >X:\diskprobe.txt echo select disk %%D
-  >>X:\diskprobe.txt echo uniqueid disk
-  diskpart /s X:\diskprobe.txt >X:\diskinfo.txt
-  findstr /i /c:"%expected%" X:\diskinfo.txt >nul && set "diskid=%%D"
+set /a matches=0
+>X:\disklist.txt echo list disk
+>>X:\disklist.txt echo exit
+diskpart /s X:\disklist.txt >X:\disklist-output.txt
+if errorlevel 1 goto failed
+for /f "usebackq tokens=2" %%D in ("X:\disklist-output.txt") do (
+  echo %%D|findstr /r /x "[0-9][0-9]*" >nul
+  if not errorlevel 1 (
+    call :probe_disk %%D
+    if errorlevel 1 goto failed
+  )
 )
-if not defined diskid goto failed
+if not "%matches%"=="1" goto failed
 >X:\unattend.xml (
   for /f "usebackq delims=" %%L in ("X:\reinstall.xml") do (
     set "line=%%L"
@@ -1223,6 +1449,18 @@ if not defined diskid goto failed
 "%media%\setup.exe" /unattend:X:\unattend.xml
 if errorlevel 1 goto failed
 exit /b
+:probe_disk
+>X:\diskprobe.txt echo select disk %~1
+>>X:\diskprobe.txt echo uniqueid disk
+>>X:\diskprobe.txt echo exit
+diskpart /s X:\diskprobe.txt >X:\diskinfo.txt
+if errorlevel 1 exit /b 1
+findstr /i /c:"%expected%" X:\diskinfo.txt >nul
+if not errorlevel 1 (
+  set "diskid=%~1"
+  set /a matches+=1
+)
+exit /b 0
 :failed
 echo Installation stopped: disk identity, media, or Windows Setup could not be verified.
 echo Check the console. Do not select or format an arbitrary disk.
@@ -1236,6 +1474,7 @@ write_windows_firstboot() {
     cat > "$directory/SetupComplete.cmd" <<'CMD'
 @echo off
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%WINDIR%\Setup\Scripts\reinstall-firstboot.ps1" > "%WINDIR%\Setup\Scripts\reinstall-firstboot.log" 2>&1
+if errorlevel 1 exit /b 1
 del /q "%WINDIR%\Panther\unattend.xml" "%WINDIR%\Panther\Unattend\unattend.xml" >nul 2>&1
 del /q "%WINDIR%\Setup\Scripts\reinstall-firstboot.ps1" >nul 2>&1
 CMD
@@ -1268,6 +1507,18 @@ PS
 Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
 Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name PortNumber -Value $RDP_PORT
 New-NetFirewallRule -DisplayName 'Remote Desktop (reinstall)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $RDP_PORT | Out-Null
+New-NetFirewallRule -DisplayName 'Remote Desktop UDP (reinstall)' -Direction Inbound -Action Allow -Protocol UDP -LocalPort $RDP_PORT | Out-Null
+Set-Service -Name TermService -StartupType Automatic
+Restart-Service -Name TermService -Force
+\$deadline = (Get-Date).AddSeconds(30)
+do {
+    \$service = Get-CimInstance -ClassName Win32_Service -Filter "Name='TermService'"
+    \$listener = Get-NetTCPConnection -State Listen -LocalPort $RDP_PORT -ErrorAction SilentlyContinue |
+        Where-Object { \$_.OwningProcess -eq \$service.ProcessId }
+    if (\$listener) { break }
+    Start-Sleep -Seconds 1
+} while ((Get-Date) -lt \$deadline)
+if (-not \$listener) { throw 'Remote Desktop did not start listening on the configured port' }
 EOF
     cat >> "$directory/reinstall-firstboot.ps1" <<'PS'
 # Remove password-bearing installation artifacts. Match only our media marker.
@@ -1355,6 +1606,9 @@ stage_error() {
 trap stage_error ERR
 stop() { printf 'STOPPED: %s\n' "$1"; exit 1; }
 [[ "$(findmnt -nro FSTYPE /)" == tmpfs ]] || stop 'Windows staging must run from the Alpine RAM filesystem.'
+if [[ "$BOOT_MODE" == bios ]] && (( DISK_BYTES > 2199023255552 )); then
+    stop 'Windows BIOS installation supports disks up to 2 TiB. Use UEFI for larger disks.'
+fi
 for tool in qemu-nbd wimlib-imagex mkfs.ntfs mkfs.fat parted partprobe lsblk blkid sfdisk python3; do
     command -v "$tool" >/dev/null || stop 'Required installation tool is missing.'
 done
@@ -1530,7 +1784,7 @@ write_grub_entry() {
     initrd_path="${BOOT_DIR#"${boot_mount%/}"}/initrd.gz"
     [[ "$filesystem_uuid" =~ ^[a-zA-Z0-9-]+$ ]] || fail 'Invalid boot filesystem UUID.'
     if [[ "$INSTALLER" == debian ]]; then
-        args='auto=true priority=critical preseed/file=/preseed.cfg net.ifnames=0 biosdevname=0'
+        args='auto=true priority=critical preseed/file=/preseed.cfg'
     else
         args="alpine_repo=$ALPINE_BASE/main modloop=$ALPINE_BASE/releases/x86_64/netboot/modloop-lts"
         args+=' apkovl=/standalone.apkovl.tar.gz modules=loop,squashfs,sd-mod,usb-storage init=/sbin/standalone-install'
@@ -1545,7 +1799,8 @@ write_grub_entry() {
     else
         args+=' console=tty0 console=ttyS0,115200n8'
     fi
-    cp -p "$GRUB_CONFIG" "$STATE_DIR/grub.cfg.before"
+    cp -p "$GRUB_CONFIG" "$STATE_DIR/grub.cfg.before.tmp"
+    mv "$STATE_DIR/grub.cfg.before.tmp" "$STATE_DIR/grub.cfg.before"
     cat > "$GRUB_FRAGMENT" <<EOF
 #!/bin/sh
 exec cat <<'GRUB_ENTRY'
@@ -1557,51 +1812,104 @@ menuentry 'Install $LABEL' --id '$ENTRY_ID' {
 GRUB_ENTRY
 EOF
     chmod 0700 "$GRUB_FRAGMENT"
-    "$GRUB_MKCONFIG" -o "$GRUB_CONFIG" >/dev/null
+    replace_grub_config || fail 'Failed to generate the reinstallation boot configuration.'
     "$GRUB_REBOOT" "$ENTRY_ID"
     "$GRUB_EDITENV" "$GRUB_ENV" list | grep -Fxq "next_entry=$ENTRY_ID" || fail 'Failed to set the one-shot boot entry.'
 }
 
+clear_pending_reinstall() {
+    local environment
+    environment=$("$GRUB_EDITENV" "$GRUB_ENV" list) || return 1
+    if grep -Fxq "next_entry=$ENTRY_ID" <<< "$environment"; then
+        "$GRUB_EDITENV" "$GRUB_ENV" unset next_entry || return 1
+        environment=$("$GRUB_EDITENV" "$GRUB_ENV" list) || return 1
+        if grep -Fxq "next_entry=$ENTRY_ID" <<< "$environment"; then return 1; fi
+    fi
+    return 0
+}
+
+replace_grub_config() {
+    local original="${1:-}" pending_config
+    pending_config=$(mktemp "${GRUB_CONFIG}.standalone.XXXXXX") || return 1
+    if [[ -n "$original" ]]; then
+        if ! cp -p "$original" "$pending_config"; then
+            rm -f "$pending_config"
+            return 1
+        fi
+    elif ! "$GRUB_MKCONFIG" -o "$pending_config" >/dev/null; then
+        rm -f "$pending_config"
+        return 1
+    fi
+    if ! mv -f "$pending_config" "$GRUB_CONFIG"; then
+        rm -f "$pending_config"
+        return 1
+    fi
+}
+
 cleanup_failed_prepare() {
-    local status=$?
+    local status=$? saved_fragment="$STATE_DIR/cleanup-fragment"
     if [[ "$PREPARING" == yes && "$status" -ne 0 ]]; then
         printf '\nCleanup: removing the incomplete reinstallation boot entry and files.\n' >&2
-        if [[ -f "$GRUB_FRAGMENT" ]]; then
-            if "$GRUB_EDITENV" "$GRUB_ENV" list | grep -Fxq "next_entry=$ENTRY_ID"; then
-                "$GRUB_EDITENV" "$GRUB_ENV" unset next_entry || true
+        if ! clear_pending_reinstall; then
+            printf 'Cleanup incomplete: GRUB boot state could not be cleared. Installer files and backups were retained. Resolve the GRUB error and run reset before rebooting.\n' >&2
+            return "$status"
+        fi
+        if [[ -f "$STATE_DIR/grub.cfg.before" ]]; then
+            if ! replace_grub_config "$STATE_DIR/grub.cfg.before"; then
+                printf 'Cleanup incomplete: previous GRUB configuration could not be restored. Installer files and backups were retained.\n' >&2
+                return "$status"
             fi
-            rm -f "$GRUB_FRAGMENT"
-            if [[ -f "$STATE_DIR/grub.cfg.before" ]]; then
-                cp -p "$STATE_DIR/grub.cfg.before" "$GRUB_CONFIG" || true
-            else
-                "$GRUB_MKCONFIG" -o "$GRUB_CONFIG" >/dev/null 2>&1 || true
+            if ! rm -f "$GRUB_FRAGMENT"; then
+                printf 'Cleanup incomplete: GRUB fragment could not be removed. Installer files were retained.\n' >&2
+                return "$status"
+            fi
+        elif [[ -f "$GRUB_FRAGMENT" ]]; then
+            if ! mv "$GRUB_FRAGMENT" "$saved_fragment"; then
+                printf 'Cleanup incomplete: GRUB fragment could not be moved. Installer files were retained.\n' >&2
+                return "$status"
+            fi
+            if ! replace_grub_config >/dev/null 2>&1; then
+                if ! mv "$saved_fragment" "$GRUB_FRAGMENT"; then
+                    printf 'Cleanup incomplete: GRUB fragment backup remains at %s.\n' "$saved_fragment" >&2
+                fi
+                printf 'Cleanup incomplete: GRUB regeneration failed. Installer files and backups were retained.\n' >&2
+                return "$status"
             fi
         fi
-        rm -rf -- "$BOOT_DIR"
-        rm -rf -- "$STATE_DIR"
+        if ! rm -rf -- "$BOOT_DIR"; then
+            printf 'Cleanup incomplete: installer files could not be removed. State and backups were retained.\n' >&2
+            return "$status"
+        fi
+        rm -rf -- "$STATE_DIR" || printf 'Cleanup incomplete: state directory could not be removed.\n' >&2
     fi
+    return "$status"
 }
 
 reset_installation() {
     if [[ "$DRY_RUN" == yes ]]; then printf 'Remove only the standalone-reinstall GRUB entry and its generated files.\n'; return; fi
     check_runtime
-    [[ -f "$GRUB_FRAGMENT" ]] || fail 'No pending installation prepared by this script was found.'
+    acquire_reinstall_lock
+    [[ -f "$GRUB_FRAGMENT" || -d "$STATE_DIR" || -d "$BOOT_DIR" ]] || fail 'No pending installation prepared by this script was found.'
     ui_section 'Cancel pending reinstallation'
     printf 'This removes the pending boot entry and installer files.\n\n'
     local answer
     read -r -p 'Type RESET to cancel the pending installation: ' answer
     [[ "$answer" == RESET ]] || { printf '\nPending reinstallation was kept.\n'; return; }
-    if "$GRUB_EDITENV" "$GRUB_ENV" list | grep -Fxq "next_entry=$ENTRY_ID"; then
-        "$GRUB_EDITENV" "$GRUB_ENV" unset next_entry
-    fi
+    clear_pending_reinstall || fail 'Cannot clear GRUB boot state. Installer files and backups were retained; resolve the error before rebooting.'
+    install -d -m 0700 "$STATE_DIR"
     local saved_fragment="$STATE_DIR/reset-fragment"
-    cp -p "$GRUB_FRAGMENT" "$saved_fragment"
-    rm -f "$GRUB_FRAGMENT"
-    if ! "$GRUB_MKCONFIG" -o "$GRUB_CONFIG" >/dev/null; then
-        cp -p "$saved_fragment" "$GRUB_FRAGMENT"
+    if [[ -f "$GRUB_FRAGMENT" ]]; then
+        cp -p "$GRUB_FRAGMENT" "$saved_fragment" || fail 'Cannot back up the GRUB fragment. Installer files were retained.'
+        rm -f "$GRUB_FRAGMENT" || fail 'Cannot remove the GRUB fragment. Installer files were retained.'
+    fi
+    if ! replace_grub_config; then
+        if [[ -f "$saved_fragment" ]] && ! cp -p "$saved_fragment" "$GRUB_FRAGMENT"; then
+            printf 'The GRUB fragment backup remains at %s.\n' "$saved_fragment" >&2
+        fi
         fail 'GRUB regeneration failed. Generated files were retained so reset can be retried.'
     fi
-    rm -rf -- "$BOOT_DIR" "$STATE_DIR"
+    rm -rf -- "$BOOT_DIR" || fail 'Cannot remove installer files. State and backups were retained; retry reset.'
+    rm -rf -- "$STATE_DIR" || fail 'Cannot remove reinstallation state; retry reset.'
     printf '\nPending reinstallation cancelled. Installer boot entry and files removed.\n'
 }
 
@@ -1609,7 +1917,7 @@ main() {
     # Read-only status for a pending reinstallation.
     if [[ "${1:-}" == --pending ]]; then
         [[ $# -eq 1 ]] || fail 'Pending status does not accept additional options.'
-        if [[ -e "$STATE_DIR" || -e "$GRUB_FRAGMENT" ]]; then return 0; fi
+        if [[ -e "$STATE_DIR" || -e "$GRUB_FRAGMENT" || -e "$BOOT_DIR" ]]; then return 0; fi
         return 1
     fi
     parse_args "$@"
@@ -1621,9 +1929,12 @@ main() {
     resolve_hostname
     if [[ "$DRY_RUN" == yes ]]; then preview; return 0; fi
     check_runtime
+    acquire_reinstall_lock
     choose_language || return 0
     detect_disk; detect_network
-    if "$GRUB_EDITENV" "$GRUB_ENV" list | grep -q '^next_entry='; then
+    local boot_environment
+    boot_environment=$("$GRUB_EDITENV" "$GRUB_ENV" list) || fail 'Cannot read the GRUB boot state.'
+    if grep -q '^next_entry=' <<< "$boot_environment"; then
         fail 'Another one-shot boot is already pending; clear it before preparing this installation.'
     fi
     [[ ! -e "$GRUB_FRAGMENT" && ! -e "$STATE_DIR" && ! -e "$BOOT_DIR" ]] || fail 'An installation state already exists; run reset before preparing again.'
@@ -1641,7 +1952,8 @@ main() {
     WORK_DIR="$STATE_DIR/work"
     PREPARING=yes
     trap cleanup_failed_prepare EXIT
-    trap 'exit 130' INT TERM
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     install -d -m 0700 "$STATE_DIR" "$BOOT_DIR" "$WORK_DIR"
     ui_section 'Preparing reinstallation'
     case "$INSTALLER" in
