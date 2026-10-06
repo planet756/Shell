@@ -29,12 +29,30 @@ WINDOWS_FILENAME='en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso
 WINDOWS_SHA256='a0334f31ea7a3e6932b9ad7206608248f0bd40698bfb8fc65f14fc5e4976c160'
 DRY_RUN=no DISK='' DISK_PTUUID='' DISK_BYTES='' BOOT_MODE=''
 NETWORK_MODE=auto NIC='' MAC='' ADDRESS='' GATEWAY='' DNS='' NETMASK=''
-HOSTNAME_VALUE='reinstall' SSH_PORT=22 RDP_PORT=3389 SSH_KEY_FILE='' ISO_URL=''
+HOSTNAME_VALUE='' SSH_PORT=22 RDP_PORT=3389 WEB_PORT=8080 WEB_PORT_SET=no WEB_TOKEN='' SSH_KEY_FILE='' ISO_URL=''
 CUSTOM_ISO_SHA256='' ISO_SOURCE=ntriver WINDOWS_ISO_OPTION=no
-PASSWORD_HASH='' WINDOWS_PASSWORD='' VIRTIO=no WORK_DIR='' PREPARING=no
+PASSWORD_HASH='' WINDOWS_PASSWORD='' GENERATED_PASSWORD='' VIRTIO=no WORK_DIR='' PREPARING=no
 GRUB_CONFIG='' GRUB_ENV='' GRUB_MKCONFIG='' GRUB_REBOOT='' GRUB_EDITENV='' GRUB_PROBE=''
 
-fail() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
+fail() { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
+
+ui_section() {
+    local color='' reset=''
+    if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR:-}" ]]; then
+        color=$'\033[1;34m'; reset=$'\033[0m'
+    fi
+    printf '\n%s%s%s\n%s\n' "$color" "$1" "$reset" '--------------------------------------'
+}
+
+ui_field() { printf '  %-12s %s\n' "$1" "$2"; }
+
+progress_step() { printf '  [%s/3] %s\n' "$1" "$2"; }
+
+login_account() {
+    if [[ "$INSTALLER" == debian ]]; then printf root
+    elif [[ "$LANGUAGE" == en-US ]]; then printf Administrator
+    else printf 'Built-in administrator'; fi
+}
 
 show_help() {
     cat <<'EOF'
@@ -56,9 +74,10 @@ Options:
   --address IPv4/PREFIX       Static address (default: current address)
   --gateway IPv4             Static gateway (default: current gateway)
   --dns IPv4[,IPv4]           Default: current upstream resolvers
-  --hostname NAME            Default: reinstall
+  --hostname NAME            Default: keep the current system hostname
   --ssh-port PORT             Debian SSH / Windows installation environment
   --ssh-key FILE              Optional local OpenSSH public key file
+  --web-port PORT             Debian installation web logs, default 8080
   --rdp-port PORT             Windows RDP port, default 3389
   --url HTTPS_URL             Debian installer directory or Windows ISO URL
   --iso HTTPS_URL             Windows ISO URL; alias of --url for Windows
@@ -95,6 +114,11 @@ select_preset() {
         IFS='|' read -r id LABEL INSTALLER RELEASE default_language <<< "$row"
         if [[ "$id" == "$requested" ]]; then
             TARGET="$id"
+            if [[ "$INSTALLER" == debian ]]; then
+                (( 10#$WEB_PORT != 10#$SSH_PORT )) || fail 'SSH and web log ports must differ.'
+            elif [[ "$WEB_PORT_SET" == yes ]]; then
+                fail '--web-port currently applies to Debian installation logs.'
+            fi
             if [[ "$INSTALLER" == debian && ( "$WINDOWS_ISO_OPTION" == yes || -n "$CUSTOM_ISO_SHA256" ) ]]; then
                 fail 'Debian needs a network installer directory via --url; --iso and --iso-sha256 are Windows-only.'
             fi
@@ -205,6 +229,22 @@ show_menu() {
 
 valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 
+resolve_hostname() {
+    if [[ -z "$HOSTNAME_VALUE" ]]; then
+        HOSTNAME_VALUE=$(uname -n) || fail 'Cannot read the current hostname. Use --hostname NAME.'
+    fi
+    if [[ "$INSTALLER" == windows ]]; then
+        [[ "$HOSTNAME_VALUE" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,14}$ &&
+           "$HOSTNAME_VALUE" != *- && ! "$HOSTNAME_VALUE" =~ ^[0-9]+$ ]] ||
+            fail 'Windows hostname must contain only letters/digits/hyphens, not be all digits, and have at most 15 characters. Use --hostname NAME.'
+    else
+        [[ "$HOSTNAME_VALUE" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ &&
+           "$HOSTNAME_VALUE" != *[-.] && "$HOSTNAME_VALUE" != *..* &&
+           "$HOSTNAME_VALUE" != *.-* && "$HOSTNAME_VALUE" != *-.* ]] ||
+            fail 'Debian hostname must contain valid letters/digits/hyphens or a domain name, with at most 63 characters. Use --hostname NAME.'
+    fi
+}
+
 parse_args() {
     local name value
     while (( $# )); do
@@ -213,7 +253,7 @@ parse_args() {
             --list) list_presets; TARGET='exit'; return ;;
             --languages) list_languages; TARGET='exit'; return ;;
             --dry-run) DRY_RUN=yes; shift; continue ;;
-            --disk|--network|--address|--gateway|--dns|--hostname|--ssh-port|--ssh-key|--rdp-port|--iso|--url|--iso-sha256|--lang)
+            --disk|--network|--address|--gateway|--dns|--hostname|--ssh-port|--ssh-key|--rdp-port|--web-port|--iso|--url|--iso-sha256|--lang)
                 name="$1"; shift
                 (( $# )) && [[ -n "$1" && "$1" != --* ]] || fail 'Option requires a value.'
                 value="$1"
@@ -227,6 +267,7 @@ parse_args() {
                     --ssh-port) SSH_PORT="$value" ;;
                     --ssh-key) SSH_KEY_FILE="$value" ;;
                     --rdp-port) RDP_PORT="$value" ;;
+                    --web-port) WEB_PORT="$value"; WEB_PORT_SET=yes ;;
                     --iso) ISO_URL="$value"; ISO_SOURCE=custom; WINDOWS_ISO_OPTION=yes ;;
                     --url) ISO_URL="$value"; ISO_SOURCE=custom ;;
                     --iso-sha256) CUSTOM_ISO_SHA256="$value" ;;
@@ -239,9 +280,7 @@ parse_args() {
         shift
     done
     case "$NETWORK_MODE" in auto|dhcp|static) ;; *) fail 'Invalid network mode.' ;; esac
-    if ! valid_port "$SSH_PORT" || ! valid_port "$RDP_PORT"; then fail 'Port must be between 1 and 65535.'; fi
-    [[ "$HOSTNAME_VALUE" =~ ^[a-zA-Z][a-zA-Z0-9-]{0,14}$ && "$HOSTNAME_VALUE" != *- ]] ||
-        fail 'Hostname must start with a letter, contain only letters/digits/hyphens, and have at most 15 characters.'
+    if ! valid_port "$SSH_PORT" || ! valid_port "$RDP_PORT" || ! valid_port "$WEB_PORT"; then fail 'Port must be between 1 and 65535.'; fi
     if [[ -n "$ISO_URL" ]]; then
         [[ "$ISO_URL" == https://* && "$ISO_URL" != *[$'\r\n']* ]] || fail 'ISO must be an HTTPS URL.'
     fi
@@ -255,22 +294,87 @@ parse_args() {
     fi
 }
 
-preview() {
-    printf 'System: %s\nInstaller: %s (implemented locally)\n' "$LABEL" "$INSTALLER"
-    printf 'Language: %s (%s)\n' "$LANGUAGE_LABEL" "$LANGUAGE"
-    printf 'Disk: %s\nNetwork: %s\n' "${DISK:-detect current root disk}" "$NETWORK_MODE"
-    if [[ "$INSTALLER" == windows ]]; then
-        printf 'Image: %s\n' "$RELEASE"
-        if [[ -n "$ISO_URL" ]]; then printf 'ISO: custom HTTPS URL (hidden)\n'
-        else printf 'ISO: NTriver automatic download; verify original IoT ISO SHA-256.\n'; fi
-        printf 'ISO file: %s\n' "$WINDOWS_FILENAME"
-        printf 'Stages: Alpine RAM environment -> original Windows Setup -> Windows.\n'
-    else
-        [[ -z "$ISO_URL" ]] || printf 'Installer source: custom HTTPS directory (hidden)\n'
-        printf 'Stages: Debian %s network installer -> Debian.\n' "$RELEASE"
+show_configuration() {
+    local mode="$1" source disk="${DISK:-Auto (current system disk)}" boot network
+    ui_field 'System:' "$LABEL"
+    ui_field 'Language:' "$LANGUAGE_LABEL ($LANGUAGE)"
+    if [[ -n "$ISO_URL" ]]; then source='Your custom source (URL hidden)'
+    elif [[ "$INSTALLER" == windows ]]; then source='NTriver / original IoT ISO'
+    else source='Debian official network installer'; fi
+    ui_field 'Source:' "$source"
+    if [[ "$mode" == detected ]]; then
+        disk+=" ($(awk -v bytes="$DISK_BYTES" 'BEGIN { printf "%.1f GiB", bytes / 1073741824 }'))"
+        if [[ "$BOOT_MODE" == efi ]]; then boot=UEFI; else boot=BIOS; fi
+    else boot='Not checked'; fi
+    ui_field 'Disk:' "$disk"
+    ui_field 'Boot:' "$boot"
+    case "$NETWORK_MODE" in
+        static) network='Static IPv4' ;;
+        dhcp) network='DHCP' ;;
+        *) network='Auto (not checked)' ;;
+    esac
+    ui_field 'Network:' "$network"
+    if [[ "$mode" == detected ]]; then
+        ui_field 'Interface:' "${NIC:+$NIC / }$MAC"
     fi
-    printf 'Preparation: download OS files, generate local install configuration, set one-shot GRUB entry.\n'
-    printf 'Reboot: manual. No external reinstall scripts are downloaded or executed.\n'
+    if [[ "$NETWORK_MODE" == static ]]; then
+        ui_field 'IPv4:' "${ADDRESS:-Not specified}"
+        ui_field 'Gateway:' "${GATEWAY:-Not specified}"
+        ui_field 'DNS:' "${DNS:-Use current system DNS}"
+    fi
+    ui_field 'Hostname:' "$HOSTNAME_VALUE"
+    if [[ "$INSTALLER" == windows ]]; then
+        ui_field 'Login:' "$(login_account) / RDP port $RDP_PORT"
+        ui_field 'ISO file:' "$WINDOWS_FILENAME"
+    else
+        ui_field 'Login:' "root / SSH port $SSH_PORT"
+        ui_field 'Progress:' "VNC / serial, SSH, web port $WEB_PORT"
+    fi
+}
+
+preview() {
+    ui_section 'Reinstall OS - Preview'
+    show_configuration preview
+    printf '\nPreview only. Disk and network have not been checked.\n'
+    printf 'Nothing is downloaded or changed. Installation requires a manual reboot.\n'
+}
+
+show_generated_password() {
+    [[ -n "${GENERATED_PASSWORD:-}" ]] || return 0
+    # Display once on the controlling terminal, never in redirected logs.
+    printf '\n  Generated password: %s\n  Save it now. It will not be shown again.\n' "$GENERATED_PASSWORD" > /dev/tty ||
+        fail 'Cannot display the generated password in the current terminal.'
+    unset GENERATED_PASSWORD
+}
+
+show_ready() {
+    ui_section 'Ready to reboot'
+    printf 'Preparation completed. Installation has not started.\n'
+    if [[ "$INSTALLER" == windows ]]; then
+        printf 'The full Windows ISO will be verified after reboot, before disk erasure.\n'
+    fi
+    show_generated_password
+    if [[ "$INSTALLER" == debian ]]; then
+        local host="${ADDRESS%/*}"
+        host="${host:-VPS_IP}"
+        printf '\n  Progress after reboot (once the network is up):\n'
+        printf '    VNC / serial: shared installer screen\n'
+        printf '    SSH: ssh -p %s root@%s\n' "$SSH_PORT" "$host"
+        if [[ -n "$SSH_KEY_FILE" ]]; then printf '    SSH login: your specified SSH key\n'
+        else printf '    SSH login: the NEW password set for this reinstallation\n'; fi
+        printf '    Installer: TERM=screen screen -x reinstall -p 1 (Ctrl+A, D to detach)\n'
+        printf '    Logs: /reinstall/view-logs.sh\n'
+        if [[ -t 0 && -n "$WEB_TOKEN" ]]; then
+            printf '    Web logs (private link): http://%s:%s/%s\n' "$host" "$WEB_PORT" "$WEB_TOKEN" > /dev/tty ||
+                fail 'Cannot show the private web log link on the terminal.'
+        else
+            printf '    Web logs: private link saved in %s/progress-access (mode 600)\n' "$STATE_DIR"
+        fi
+        printf '    Allow inbound TCP %s and %s in the VPS firewall.\n' "$SSH_PORT" "$WEB_PORT"
+    fi
+    printf '\n  Start installation:\n    sudo reboot\n'
+    printf '\n  Cancel before reboot:\n    sudo bash debiankit.sh reinstall reset\n'
+    printf '\nWARNING: Starting installation will erase ALL partitions and data on %s.\n' "$DISK"
 }
 
 find_grub() {
@@ -411,7 +515,8 @@ PY
 
 read_password() {
     local password confirmation generated=no
-    read -r -s -p 'New root / Administrator password (Enter = random): ' password || fail 'Password input ended; installation was not prepared.'
+    GENERATED_PASSWORD=''
+    read -r -s -p 'New password [Enter = generate]: ' password || fail 'Password input ended; installation was not prepared.'
     printf '\n'
     if [[ -z "$password" ]]; then
         password=$(python3 - <<'PY'
@@ -436,8 +541,9 @@ PY
         WINDOWS_PASSWORD=$(printf '%s' "$password" | python3 -c 'import sys,base64; print(base64.b64encode((sys.stdin.read()+"AdministratorPassword").encode("utf-16le")).decode())')
     fi
     if [[ "$generated" == yes ]]; then
-        # Keep generated credentials on the controlling terminal, out of redirected logs.
-        printf 'Generated login password (save it before reboot): %s\n' "$password" > /dev/tty || fail 'Cannot display the generated password in the current terminal.'
+        # Verify the terminal before preparing boot files, then show the password with the result.
+        { : > /dev/tty; } 2>/dev/null || fail 'A controlling terminal is required to show the generated password.'
+        GENERATED_PASSWORD="$password"
     fi
     unset password confirmation
 }
@@ -506,7 +612,6 @@ PY
 resolve_iso() {
     local value="$WINDOWS_FILENAME"
     if [[ -n "$ISO_URL" ]]; then ISO_SOURCE=custom; value="$ISO_URL"; fi
-    printf 'Checking the %s ISO source for %s...\n' "$ISO_SOURCE" "$RELEASE"
     write_windows_iso_resolver "$WORK_DIR/resolve-iso.py"
     python3 "$WORK_DIR/resolve-iso.py" "$ISO_SOURCE" "$value" "$WORK_DIR/iso-url" "$WINDOWS_SHA256" ||
         fail 'ISO source check failed. No boot entry was created.'
@@ -522,6 +627,378 @@ pack_initrd() {
 
 # Installer generators are defined below. All generated automation is local.
 
+write_debian_package_tool() {
+    cat > "$1" <<'PY'
+import gzip
+import hashlib
+import io
+from pathlib import Path, PurePosixPath
+import posixpath
+import re
+import sys
+import tarfile
+
+def records(text):
+    result = {}
+    for block in text.split('\n\n'):
+        record = {}
+        key = None
+        for line in block.splitlines():
+            if line.startswith(' ') and key:
+                record[key] += ' ' + line.strip()
+            elif ': ' in line:
+                key, value = line.split(': ', 1)
+                record[key] = value
+        if 'Package' in record:
+            result[record['Package']] = record
+    return result
+
+def plan(release, index, destination):
+    expected = None
+    in_hashes = False
+    index_name = 'main/debian-installer/binary-amd64/Packages.gz'
+    for line in Path(release).read_text().splitlines():
+        if not line.startswith(' '):
+            in_hashes = line == 'SHA256:'
+        elif in_hashes:
+            fields = line.split()
+            if len(fields) == 3 and fields[2] == index_name:
+                expected = fields[0]
+    data = Path(index).read_bytes()
+    if not expected or hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError('Debian installer package index checksum failed.')
+    packages = records(gzip.decompress(data).decode())
+    selected = set()
+    ordered = []
+    def add(name):
+        if name in selected:
+            return
+        if name not in packages:
+            raise ValueError('Required Debian installer package is unavailable.')
+        selected.add(name)
+        record = packages[name]
+        for dependency in record.get('Depends', '').split(','):
+            if not dependency.strip():
+                continue
+            choices = [re.match(r'\s*([a-z0-9+.-]+)', item).group(1) for item in dependency.split('|')]
+            available = next((item for item in choices if item in packages), None)
+            if not available:
+                raise ValueError('Required installer package dependency is unavailable.')
+            add(available)
+        filename = record.get('Filename', '')
+        digest = record.get('SHA256', '')
+        if (not re.fullmatch(r'pool/[A-Za-z0-9+._~/-]+\.udeb', filename)
+                or '..' in PurePosixPath(filename).parts or not re.fullmatch('[0-9a-f]{64}', digest)):
+            raise ValueError('Invalid installer package metadata.')
+        ordered.append(name+'\t'+filename+'\t'+digest)
+    for name in ('openssh-server-udeb', 'screen-udeb'):
+        add(name)
+    Path(destination).write_text('\n'.join(ordered)+'\n')
+
+def normalized(name):
+    name = name[2:] if name.startswith('./') else name
+    path = PurePosixPath(name)
+    if path.is_absolute() or '..' in path.parts:
+        raise ValueError('Unsafe package path.')
+    if not path.parts:
+        return ''
+    # Debian 13's installer uses usrmerge. Keep the overlay consistent with it.
+    if path.parts[0] in ('bin', 'sbin', 'lib', 'lib64'):
+        path = PurePosixPath('usr') / path
+    return str(path)
+
+def extract(archive, destination):
+    data = Path(archive).read_bytes()
+    if not data.startswith(b'!<arch>\n'):
+        raise ValueError('Invalid Debian archive.')
+    offset = 8
+    payload = None
+    while offset + 60 <= len(data):
+        header = data[offset:offset+60]
+        if header[58:60] != b'`\n':
+            raise ValueError('Invalid archive header.')
+        name = header[:16].decode().strip().rstrip('/')
+        size = int(header[48:58])
+        offset += 60
+        if name.startswith('data.tar.'):
+            payload = data[offset:offset+size]
+            break
+        offset += size + size % 2
+    if payload is None:
+        raise ValueError('Debian archive has no data payload.')
+    root = Path(destination).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(payload), mode='r:*') as package:
+        for member in package:
+            name = normalized(member.name)
+            if not name or name == '.':
+                continue
+            target = root / name
+            if root not in (target.resolve(), *target.resolve().parents):
+                raise ValueError('Package path escapes the overlay.')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if member.isdir():
+                target.mkdir(exist_ok=True)
+                target.chmod(member.mode & 0o777)
+            elif member.isfile():
+                if target.is_symlink():
+                    target.unlink()
+                target.write_bytes(package.extractfile(member).read())
+                target.chmod(member.mode & 0o777)
+            elif member.issym():
+                if member.linkname.startswith('/'):
+                    link = posixpath.relpath(normalized(member.linkname[1:]), str(PurePosixPath(name).parent))
+                else:
+                    link = member.linkname
+                if root not in ((target.parent/link).resolve(), *(target.parent/link).resolve().parents):
+                    raise ValueError('Unsafe package symlink.')
+                if target.exists() or target.is_symlink():
+                    target.unlink()
+                target.symlink_to(link)
+            else:
+                raise ValueError('Unsupported package archive entry.')
+
+try:
+    if sys.argv[1] == 'plan':
+        plan(*sys.argv[2:])
+    elif sys.argv[1] == 'extract':
+        extract(*sys.argv[2:])
+    else:
+        raise ValueError('Unknown installer package operation.')
+except (ValueError, KeyError, OSError, tarfile.TarError) as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+prepare_debian_monitor_packages() {
+    local name filename digest
+    write_debian_package_tool "$WORK_DIR/debian-packages.py"
+    download "$DEBIAN_MIRROR/dists/$RELEASE/Release" "$WORK_DIR/debian-release"
+    download "$DEBIAN_MIRROR/dists/$RELEASE/main/debian-installer/binary-amd64/Packages.gz" "$WORK_DIR/debian-packages.gz"
+    python3 "$WORK_DIR/debian-packages.py" plan "$WORK_DIR/debian-release" "$WORK_DIR/debian-packages.gz" "$WORK_DIR/debian-package-plan" ||
+        fail 'Cannot resolve verified Debian monitoring packages.'
+    while IFS=$'\t' read -r name filename digest; do
+        download "$DEBIAN_MIRROR/$filename" "$WORK_DIR/$name.udeb"
+        check_hash "$WORK_DIR/$name.udeb" "$digest"
+        python3 "$WORK_DIR/debian-packages.py" extract "$WORK_DIR/$name.udeb" "$WORK_DIR/overlay" ||
+            fail 'Cannot extract a verified Debian monitoring package.'
+    done < "$WORK_DIR/debian-package-plan"
+}
+
+write_debian_monitoring() {
+    local directory="$1" key='' host="${ADDRESS%/*}"
+    [[ -z "$SSH_KEY_FILE" ]] || key=$(cat "$SSH_KEY_FILE")
+    WEB_TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(24))') || fail 'Cannot generate the private web log address.'
+    install -d -m 0700 "$directory/reinstall"
+    chmod 0755 "$directory"
+    install -d -m 0755 "$directory/usr/lib/debian-installer.d" "$directory/usr/lib/debian-installer-startup.d" "$directory/usr/sbin"
+    printf 'SSH_PORT=%s\nWEB_PORT=%s\nWEB_TOKEN=%s\n' "$SSH_PORT" "$WEB_PORT" "$WEB_TOKEN" > "$directory/reinstall/progress.conf"
+    printf '%s\n' "$PASSWORD_HASH" > "$directory/reinstall/password-hash"
+    if [[ ! -f "$directory/reinstall/ssh-host-key" ]]; then
+        ssh-keygen -q -t ed25519 -N '' -f "$directory/reinstall/ssh-host-key" </dev/null >/dev/null 2>&1 ||
+            fail 'Cannot generate the installation SSH host key.'
+    fi
+    if [[ -n "$key" ]]; then printf '%s\n' "$key" > "$directory/reinstall/authorized_keys"; fi
+    printf 'http://%s:%s/%s\n' "${host:-VPS_IP}" "$WEB_PORT" "$WEB_TOKEN" > "$WORK_DIR/../progress-access"
+    chmod 0600 "$directory/reinstall/progress.conf" "$directory/reinstall/password-hash" "$WORK_DIR/../progress-access"
+    cat > "$directory/reinstall/filter-logs.awk" <<'AWK'
+/BEGIN .*PRIVATE KEY/ {private_key=1; next}
+private_key {if ($0 ~ /END .*PRIVATE KEY/) private_key=0; next}
+{ line=tolower($0) }
+line !~ /password|passwd|token|secret|authorization|authorized_keys|preseed|shadow|private key/ &&
+$0 !~ /\$[1256y]\$/ {
+    gsub(/https?:\/\/[^[:space:]]+/, "[download URL]", $0)
+    print; fflush()
+}
+AWK
+    cat > "$directory/reinstall/view-logs.sh" <<'SH'
+#!/bin/sh
+tail -n 80 -f /var/log/syslog | awk -f /reinstall/filter-logs.awk
+SH
+    cat > "$directory/reinstall/web-request.sh" <<'SH'
+#!/bin/sh
+set -eu
+. /reinstall/progress.conf
+request_pid=$$
+(sleep 10; kill -TERM "$request_pid" 2>/dev/null || true) </dev/null >/dev/null 2>&1 &
+watchdog=$!
+trap 'kill "$watchdog" 2>/dev/null || true' EXIT
+response() {
+    printf 'HTTP/1.0 %s\r\nContent-Type: %s\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n' "$1" "$2"
+}
+IFS=' ' read -r method path version || exit 0
+lines=0
+while IFS= read -r header; do
+    [ "$header" != "$(printf '\r')" ] && [ -n "$header" ] || break
+    lines=$((lines + 1))
+    [ "$lines" -le 40 ] && [ "${#header}" -le 4096 ] || exit 0
+done
+if [ "$method" != GET ]; then response '405 Method Not Allowed' 'text/plain'; exit 0; fi
+case "$path" in
+    "/$WEB_TOKEN"|"/$WEB_TOKEN/")
+        response '200 OK' 'text/html; charset=utf-8'
+        cat <<'HTML'
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Debian installation progress</title>
+<style>body{margin:2rem auto;max-width:1100px;padding:0 1rem;background:#111827;color:#e5e7eb;font:16px system-ui}header{display:flex;justify-content:space-between;gap:1rem;align-items:center}h1{font-size:1.4rem}#status{color:#93c5fd}pre{background:#030712;border:1px solid #374151;border-radius:8px;padding:1rem;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}p{color:#9ca3af}</style>
+<header><h1>Debian installation progress</h1><span id="status">Connecting...</span></header>
+<p>Updates every 2 seconds. Closing this page does not stop installation. An unreachable page can mean the server is rebooting; use VNC to confirm.</p>
+<pre id="log">Waiting for installer logs...</pre>
+<script>
+const base=location.pathname.replace(/\/$/,''),output=document.getElementById('log'),status=document.getElementById('status');
+async function update(){try{const response=await fetch(base+'/logs',{cache:'no-store'});if(!response.ok)throw Error();output.textContent=await response.text();status.textContent='Updated '+new Date().toLocaleTimeString();}catch{status.textContent='Connection lost - check VNC';}finally{setTimeout(update,2000);}}update();
+</script></html>
+HTML
+        ;;
+    "/$WEB_TOKEN/logs")
+        response '200 OK' 'text/plain; charset=utf-8'
+        {
+            if [ -r /var/log/reinstall-monitor.log ]; then tail -n 120 /var/log/reinstall-monitor.log; fi
+            if [ -r /var/log/syslog ]; then tail -n 160 /var/log/syslog
+            else printf 'Waiting for installer logs...\n'; fi
+        } | awk -f /reinstall/filter-logs.awk
+        ;;
+    *) response '404 Not Found' 'text/plain'; printf 'Not found.\n' ;;
+esac
+SH
+    cat > "$directory/reinstall/web-server.sh" <<'SH'
+#!/bin/sh
+set -eu
+. /reinstall/progress.conf
+while :; do
+    # BusyBox's persistent listener forks a handler per connection, without polling gaps.
+    nc -ll -p "$WEB_PORT" -e /reinstall/web-request.sh || sleep 1
+done
+SH
+    cat > "$directory/reinstall/console-session.sh" <<'SH'
+#!/bin/sh
+set -eu
+export TERM="${TERM:-linux}"
+count=0
+until screen -ls 2>/dev/null | grep -q '\.reinstall[[:space:]]'; do
+    count=$((count + 1))
+    if [ "$count" -eq 15 ]; then printf 'Waiting for the primary installer console...\n'; fi
+    sleep 1
+done
+exec screen -x reinstall -p 1
+SH
+    cat > "$directory/usr/sbin/reopen-console" <<'SH'
+#!/bin/sh
+# Start the official installer once, on a usable visual console when present.
+set -eu
+mkdir -p /var/run /var/log
+primary=''
+visual=no
+[ ! -d /sys/class/graphics/fb0 ] || visual=yes
+for class in /sys/bus/pci/devices/*/class; do
+    [ -r "$class" ] || continue
+    case "$(cat "$class")" in 0x0300*) visual=yes ;; esac
+done
+if [ "$visual" = yes ] && [ -c /dev/tty1 ] && stty -g -F /dev/tty1 >/dev/null 2>&1; then
+    primary=/dev/tty1
+else
+    primary=$(awk '/\([^)]*C[^)]*\)/ {print "/dev/"$1; exit}' /proc/consoles)
+    [ "$primary" != /dev/tty0 ] || primary=/dev/tty1
+    [ -n "$primary" ] && [ -c "$primary" ] || primary=/dev/console
+fi
+printf '%s\n' "$primary" > /var/run/console-preferred
+printf '%s\n' "$primary" > /var/run/console-devices
+tty=${primary##*/}
+grep -q "^$tty::respawn:/sbin/debian-installer$" /etc/inittab ||
+    printf '%s::respawn:/sbin/debian-installer\n' "$tty" >> /etc/inittab
+printf 'Primary installer console: %s\n' "$primary" >> /var/log/reinstall-monitor.log
+/sbin/steal-ctty "$primary" "$@"
+kill -HUP 1
+SH
+    cat > "$directory/usr/lib/debian-installer.d/S70menu" <<'SH'
+# One installer process, shared by VGA, serial consoles and SSH.
+set +e
+if screen -ls 2>/dev/null | grep -q '\.reinstall[[:space:]]'; then
+    screen -x reinstall -p 1
+else
+    screen -U -S reinstall -t installer /lib/debian-installer/menu
+fi
+EXIT=$?
+set -e
+SH
+    cat > "$directory/reinstall/start-monitoring.sh" <<'SH'
+#!/bin/sh
+set -eu
+. /reinstall/progress.conf
+mkdir -p /run/sshd /etc/ssh /root/.ssh /var/log
+chmod 0755 /run/sshd
+chmod 0700 /root /root/.ssh
+hash=$(cat /reinstall/password-hash)
+awk -F: 'BEGIN {OFS=FS} $1=="root" {$2="x";$6="/root";$7="/bin/sh"} {print}' /etc/passwd > /etc/passwd.reinstall
+mv /etc/passwd.reinstall /etc/passwd
+if [ -f /etc/shadow ]; then
+    awk -F: -v hash="$hash" 'BEGIN {OFS=FS} $1=="root" {$2=hash;found=1} {print} END {if(!found) print "root",hash,1,0,99999,7,"","",""}' /etc/shadow > /etc/shadow.reinstall
+else
+    printf 'root:%s:1:0:99999:7:::\n' "$hash" > /etc/shadow.reinstall
+fi
+chmod 0600 /etc/shadow.reinstall
+mv /etc/shadow.reinstall /etc/shadow
+unset hash
+grep -q '^sshd:' /etc/passwd || printf 'sshd:x:100:65534:sshd:/run/sshd:/bin/false\n' >> /etc/passwd
+grep -q '^nogroup:' /etc/group || printf 'nogroup:x:65534:\n' >> /etc/group
+cat > /etc/ssh/sshd_config <<EOF
+Port $SSH_PORT
+HostKey /reinstall/ssh-host-key
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+PrintMotd yes
+AuthorizedKeysFile /root/.ssh/authorized_keys
+Subsystem sftp internal-sftp
+AllowUsers root
+EOF
+if [ -s /reinstall/authorized_keys ]; then
+    cp /reinstall/authorized_keys /root/.ssh/authorized_keys
+    chmod 0600 /root/.ssh/authorized_keys
+    printf 'PasswordAuthentication no\n' > /tmp/reinstall-key-sshd
+    cat /etc/ssh/sshd_config >> /tmp/reinstall-key-sshd
+    mv /tmp/reinstall-key-sshd /etc/ssh/sshd_config
+fi
+cat > /etc/motd <<'MOTD'
+Reinstallation is in progress.
+  Installer: TERM=screen screen -x reinstall -p 1
+  Detach:    Ctrl+A, then D (installation continues)
+  Logs:      /reinstall/view-logs.sh
+MOTD
+if ! grep -q 'reinstall/console-session.sh' /etc/inittab; then
+    primary=$(awk '{print $1}' /var/run/console-preferred 2>/dev/null || true)
+    for tty in tty1 ttyS0; do
+        [ "/dev/$tty" != "$primary" ] || continue
+        [ -c "/dev/$tty" ] || continue
+        stty -g -F "/dev/$tty" >/dev/null 2>&1 || continue
+        grep -q "^$tty:" /etc/inittab && continue
+        printf '%s::respawn:/reinstall/console-session.sh\n' "$tty" >> /etc/inittab
+    done
+fi
+/usr/sbin/sshd -t
+if ! pidof sshd >/dev/null 2>&1; then
+    /usr/sbin/sshd -D -E /var/log/reinstall-monitor.log &
+    ssh_pid=$!
+    sleep 1
+    kill -0 "$ssh_pid" 2>/dev/null || { echo 'Installation SSH failed to start.' >&2; exit 1; }
+fi
+if [ ! -e /run/reinstall-web.pid ] || ! kill -0 "$(cat /run/reinstall-web.pid)" 2>/dev/null; then
+    /reinstall/web-server.sh >/var/log/reinstall-web.log 2>&1 &
+    echo $! >/run/reinstall-web.pid
+fi
+printf 'Monitoring enabled: VNC/serial, SSH port %s, web port %s.\n' "$SSH_PORT" "$WEB_PORT" >> /var/log/reinstall-monitor.log
+SH
+    cat > "$directory/usr/lib/debian-installer-startup.d/S34reinstall-monitor" <<'SH'
+#!/bin/sh
+/reinstall/start-monitoring.sh >>/var/log/reinstall-monitor.log 2>&1 ||
+    logger -t reinstall 'Monitoring startup failed; installation continues. Inspect /var/log/reinstall-monitor.log from VNC.'
+SH
+    chmod 0755 "$directory/reinstall/"*.sh "$directory/usr/lib/debian-installer-startup.d/S34reinstall-monitor"
+    chmod 0755 "$directory/usr/sbin/reopen-console"
+    chmod 0644 "$directory/usr/lib/debian-installer.d/S70menu"
+}
+
 write_debian_payload() {
     local directory="$1" key=''
     install -d -m 0700 "$directory/reinstall"
@@ -531,6 +1008,7 @@ d-i debian-installer/locale string $DEBIAN_LOCALE
 d-i keyboard-configuration/xkb-keymap select $KEYMAP
 d-i netcfg/choose_interface select auto
 d-i netcfg/get_hostname string $HOSTNAME_VALUE
+d-i netcfg/hostname string $HOSTNAME_VALUE
 d-i netcfg/get_domain string local
 d-i hw-detect/load_firmware boolean true
 d-i mirror/country string manual
@@ -562,7 +1040,7 @@ d-i grub-installer/only_debian boolean true
 d-i grub-installer/with_other_os boolean false
 d-i finish-install/reboot_in_progress note
 d-i partman/early_command string /bin/sh /reinstall/select-disk.sh
-d-i preseed/late_command string cp /reinstall/postinstall.sh /target/root/postinstall.sh; in-target /bin/sh /root/postinstall.sh; rm -f /target/root/postinstall.sh
+d-i preseed/late_command string cp /reinstall/postinstall.sh /target/root/postinstall.sh && cp /reinstall/ssh-host-key /target/etc/ssh/ssh_host_ed25519_key && cp /reinstall/ssh-host-key.pub /target/etc/ssh/ssh_host_ed25519_key.pub && in-target /bin/sh /root/postinstall.sh && rm -f /target/root/postinstall.sh
 EOF
     if [[ "$NETWORK_MODE" == static ]]; then
         cat >> "$directory/preseed.cfg" <<EOF
@@ -585,15 +1063,19 @@ for disk in \$(list-devices disk); do
     if [ "\$id" = "\$expected" ]; then matched="\$disk"; count=\$((count + 1)); fi
 done
 if [ "\$count" != 1 ]; then
+    logger -t reinstall 'STOPPED: target disk identity could not be verified. No disk was selected.'
     echo 'STOPPED: target disk identity could not be verified. No disk was selected.' >/dev/console
     while :; do sleep 3600; done
 fi
+logger -t reinstall "Target disk verified: \$matched. Partitioning and installation can proceed."
 debconf-set partman-auto/disk "\$matched"
 debconf-set grub-installer/bootdev "\$matched"
 EOF
     cat > "$directory/reinstall/postinstall.sh" <<EOF
 #!/bin/sh
 set -eu
+# Keep the exact hostname, including an FQDN that netcfg splits into host/domain.
+printf '%s\n' '$HOSTNAME_VALUE' > /etc/hostname
 mkdir -p /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/99-reinstall.conf <<'SSH'
 Port $SSH_PORT
@@ -608,13 +1090,13 @@ EOF
         printf "cat > /root/.ssh/authorized_keys <<'REINSTALL_PUBLIC_KEY'\n%s\nREINSTALL_PUBLIC_KEY\nchmod 0600 /root/.ssh/authorized_keys\n" "$key" >> "$directory/reinstall/postinstall.sh"
     fi
     chmod 0700 "$directory/reinstall/"*.sh
+    write_debian_monitoring "$directory"
 }
 
 prepare_debian() {
     local base="${ISO_URL%/}" asset digest
     [[ -n "$base" ]] || base="$DEBIAN_MIRROR/dists/$RELEASE/main/installer-amd64/current/images"
-    if [[ -n "$ISO_URL" ]]; then printf 'Downloading Debian installer files from your custom source...\n'
-    else printf 'Downloading official Debian installer files...\n'; fi
+    progress_step 1 'Download and verify Debian installer files'
     download "$base/SHA256SUMS" "$WORK_DIR/SHA256SUMS"
     for asset in linux initrd.gz; do
         download "$base/netboot/debian-installer/amd64/$asset" "$WORK_DIR/$asset"
@@ -622,6 +1104,8 @@ prepare_debian() {
         [[ "$digest" =~ ^[a-fA-F0-9]{64}$ ]] || fail 'Debian checksum is missing from the source manifest.'
         check_hash "$WORK_DIR/$asset" "$digest"
     done
+    prepare_debian_monitor_packages
+    progress_step 2 'Build installation configuration'
     write_debian_payload "$WORK_DIR/overlay"
     cp "$WORK_DIR/linux" "$BOOT_DIR/linux"
     pack_initrd "$WORK_DIR/initrd.gz" "$WORK_DIR/overlay" "$BOOT_DIR/initrd.gz"
@@ -806,13 +1290,14 @@ PS
 }
 
 prepare_windows() {
+    progress_step 1 'Check ISO link and download boot files'
     resolve_iso
     local overlay="$WORK_DIR/overlay" payload="$WORK_DIR/apkovl" assignment
     install -d -m 0700 "$overlay" "$payload/reinstall" "$payload/sbin" "$payload/etc/apk" "$payload/etc/ssh"
-    printf 'Downloading official Alpine boot files...\n'
     download "$ALPINE_BASE/releases/x86_64/netboot/vmlinuz-lts" "$BOOT_DIR/linux"
     download "$ALPINE_BASE/releases/x86_64/netboot/initramfs-lts" "$WORK_DIR/alpine-initrd"
     gzip -t "$WORK_DIR/alpine-initrd" || fail 'Alpine initramfs is invalid.'
+    progress_step 2 'Build installation configuration'
     for assignment in \
         "DISK_PTUUID=$DISK_PTUUID" "DISK_BYTES=$DISK_BYTES" "BOOT_MODE=$BOOT_MODE" \
         "ISO_URL=$ISO_URL" "ISO_SOURCE=$ISO_SOURCE" "WINDOWS_FILENAME=$WINDOWS_FILENAME" \
@@ -1053,7 +1538,13 @@ write_grub_entry() {
         if [[ "$NETWORK_MODE" == dhcp ]]; then args+=' ip=dhcp'
         else args+=" ip=${ADDRESS%/*}::$GATEWAY:$NETMASK:::none:${DNS%%,*}"; fi
     fi
-    args+=" BOOTIF=01-${MAC//:/-} console=tty0 console=ttyS0,115200n8"
+    args+=" BOOTIF=01-${MAC//:/-}"
+    if [[ "$INSTALLER" == debian ]]; then
+        # The last console becomes /dev/console: keep Debian's installer on VGA/VNC.
+        args+=' console=ttyS0,115200n8 console=tty0'
+    else
+        args+=' console=tty0 console=ttyS0,115200n8'
+    fi
     cp -p "$GRUB_CONFIG" "$STATE_DIR/grub.cfg.before"
     cat > "$GRUB_FRAGMENT" <<EOF
 #!/bin/sh
@@ -1074,7 +1565,7 @@ EOF
 cleanup_failed_prepare() {
     local status=$?
     if [[ "$PREPARING" == yes && "$status" -ne 0 ]]; then
-        printf 'Preparation failed; removing this script\047s pending boot entry.\n' >&2
+        printf '\nCleanup: removing the incomplete reinstallation boot entry and files.\n' >&2
         if [[ -f "$GRUB_FRAGMENT" ]]; then
             if "$GRUB_EDITENV" "$GRUB_ENV" list | grep -Fxq "next_entry=$ENTRY_ID"; then
                 "$GRUB_EDITENV" "$GRUB_ENV" unset next_entry || true
@@ -1095,9 +1586,11 @@ reset_installation() {
     if [[ "$DRY_RUN" == yes ]]; then printf 'Remove only the standalone-reinstall GRUB entry and its generated files.\n'; return; fi
     check_runtime
     [[ -f "$GRUB_FRAGMENT" ]] || fail 'No pending installation prepared by this script was found.'
+    ui_section 'Cancel pending reinstallation'
+    printf 'This removes the pending boot entry and installer files.\n\n'
     local answer
     read -r -p 'Type RESET to cancel the pending installation: ' answer
-    [[ "$answer" == RESET ]] || { printf 'Cancelled.\n'; return; }
+    [[ "$answer" == RESET ]] || { printf '\nPending reinstallation was kept.\n'; return; }
     if "$GRUB_EDITENV" "$GRUB_ENV" list | grep -Fxq "next_entry=$ENTRY_ID"; then
         "$GRUB_EDITENV" "$GRUB_ENV" unset next_entry
     fi
@@ -1109,7 +1602,7 @@ reset_installation() {
         fail 'GRUB regeneration failed. Generated files were retained so reset can be retried.'
     fi
     rm -rf -- "$BOOT_DIR" "$STATE_DIR"
-    printf 'Pending installation cancelled.\n'
+    printf '\nPending reinstallation cancelled. Installer boot entry and files removed.\n'
 }
 
 main() {
@@ -1125,44 +1618,42 @@ main() {
     elif [[ "$TARGET" != reset ]]; then select_preset "$TARGET"; fi
     [[ "$TARGET" != exit ]] || return 0
     if [[ "$TARGET" == reset ]]; then reset_installation; return; fi
-    if [[ "$DRY_RUN" != yes ]]; then
-        check_runtime
-        choose_language || return 0
-    fi
-    preview
-    [[ "$DRY_RUN" != yes ]] || return 0
+    resolve_hostname
+    if [[ "$DRY_RUN" == yes ]]; then preview; return 0; fi
+    check_runtime
+    choose_language || return 0
     detect_disk; detect_network
     if "$GRUB_EDITENV" "$GRUB_ENV" list | grep -q '^next_entry='; then
         fail 'Another one-shot boot is already pending; clear it before preparing this installation.'
     fi
     [[ ! -e "$GRUB_FRAGMENT" && ! -e "$STATE_DIR" && ! -e "$BOOT_DIR" ]] || fail 'An installation state already exists; run reset before preparing again.'
-    printf '\nTarget system: %s\n' "$LABEL"
-    printf 'Target disk: %s (partition-table ID %s)\n' "$DISK" "$DISK_PTUUID"
-    printf 'Network: %s; interface MAC %s\n' "$NETWORK_MODE" "$MAC"
-    [[ "$NETWORK_MODE" != static ]] || printf 'IPv4: %s; gateway %s; DNS %s\n' "$ADDRESS" "$GATEWAY" "$DNS"
+    ui_section 'Reinstall OS - Review'
+    show_configuration detected
     printf '\nPreparation will update the boot configuration.\n'
     printf 'Installation starts after a manual reboot.\n'
-    printf 'WARNING: Installation will erase ALL partitions and data on %s.\n' "$DISK"
+    printf '\nWARNING: Installation will erase ALL partitions and data on %s.\n\n' "$DISK"
     local answer
-    read -r -p 'Type REINSTALL to prepare, or press Enter to cancel: ' answer || return 0
-    [[ "$answer" == REINSTALL ]] || { printf 'Cancelled.\n'; return 0; }
+    read -r -p 'Type REINSTALL to prepare [Enter = cancel]: ' answer || { printf '\nCancelled. No reinstallation was prepared.\n'; return 0; }
+    [[ "$answer" == REINSTALL ]] || { printf '\nCancelled. No reinstallation was prepared.\n'; return 0; }
+    ui_section 'Login password'
+    ui_field 'Account:' "$(login_account)"
     read_password
     WORK_DIR="$STATE_DIR/work"
     PREPARING=yes
     trap cleanup_failed_prepare EXIT
     trap 'exit 130' INT TERM
     install -d -m 0700 "$STATE_DIR" "$BOOT_DIR" "$WORK_DIR"
+    ui_section 'Preparing reinstallation'
     case "$INSTALLER" in
         debian) prepare_debian ;;
         windows) prepare_windows ;;
         *) fail 'Unsupported installer in OS_PRESETS.' ;;
     esac
+    progress_step 3 'Set one-shot boot entry'
     write_grub_entry
     PREPARING=no
     unset PASSWORD_HASH WINDOWS_PASSWORD
-    printf '\nInstallation prepared. Reboot manually with: sudo reboot\n'
-    printf 'Cancel BEFORE reboot with: sudo bash debiankit.sh reinstall reset\n'
-    printf 'Once installation starts, reset cannot restore erased data.\n'
+    show_ready
 }
 
 if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then main "$@"; fi

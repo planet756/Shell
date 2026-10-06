@@ -162,7 +162,7 @@ reinstall_menu() {
                 ;;
         esac
         if ! run_module reinstall "$selected"; then
-            log WARN 'The selected action did not complete. Review its output before continuing.'
+            printf '\n[FAILED] Reinstall action did not complete. See the error above.\n' >&2
         fi
         pause || return 0
     done
