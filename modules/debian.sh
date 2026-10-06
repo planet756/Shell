@@ -1657,49 +1657,6 @@ install_komari_agent() {
     fi
 }
 
-# Install all components
-install_all() {
-    log "INFO" "Starting full installation..."
-    echo ""
-
-    local failed_components=()
-
-    # Install each component
-    echo -e "${BLUE}=== Installing BBR ===${NC}"
-    install_bbr || failed_components+=("BBR")
-    echo ""
-
-    echo -e "${BLUE}=== Installing Docker ===${NC}"
-    install_docker || failed_components+=("Docker")
-    echo ""
-
-    echo -e "${BLUE}=== Installing Node.js ===${NC}"
-    install_nodejs || failed_components+=("Node.js")
-    echo ""
-
-    echo -e "${BLUE}=== Installing Go ===${NC}"
-    install_go || failed_components+=("Go")
-    echo ""
-
-    echo -e "${BLUE}=== Installing Telegraf ===${NC}"
-    install_telegraf || failed_components+=("Telegraf")
-    echo ""
-
-    echo -e "${BLUE}=== Installing Komari Agent ===${NC}"
-    install_komari_agent || failed_components+=("Komari Agent")
-    echo ""
-
-    # Summary
-    echo -e "${BLUE}======================================${NC}"
-    if [[ ${#failed_components[@]} -eq 0 ]]; then
-        log "SUCCESS" "All components installed successfully!"
-    else
-        log "WARN" "Installation completed with some failures"
-        log "WARN" "Failed components: ${failed_components[*]}"
-    fi
-    echo -e "${BLUE}======================================${NC}"
-}
-
 debian_main() {
     local action="${1:-}" handler
     [[ $# -eq 1 ]] || error_exit 'Choose one Debian configuration action.'
@@ -1712,7 +1669,6 @@ debian_main() {
         komari) handler=install_komari_agent ;;
         nodejs) handler=install_nodejs ;;
         go) handler=install_go ;;
-        all) handler=install_all ;;
         reset-init) handler='' ;;
         *) error_exit 'Unknown Debian configuration action.' ;;
     esac

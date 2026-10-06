@@ -80,7 +80,6 @@ show_menu() {
         '08. Install Go (Official Binary)' \
         '09. Reinstall OS' \
         '' \
-        '99. Install All' \
         '00. Exit'
     printf '%b\n' "${BLUE}======================================${NC}"
     printf '%b\n' "${YELLOW}Tip: Type 'reset' to reset initialization${NC}"
@@ -99,12 +98,12 @@ Usage:
   bash debiankit.sh reinstall --dry-run PRESET    Preview reinstallation
   sudo bash debiankit.sh reinstall reset          Cancel BEFORE reboot
 
-Debian actions: sources, user, bbr, docker, telegraf, komari, nodejs, go, all,
+Debian actions: sources, user, bbr, docker, telegraf, komari, nodejs, go,
                 reset-init
 Reinstall presets: debian13, windows10-iot-ltsc
 Run bash debiankit.sh reinstall --help for reinstallation options.
 Menu option 09 opens Reinstall OS: choose a system, cancel pending installation,
-or return to the main menu. Option 99 runs the original setup components.
+or return to the main menu.
 EOF
 }
 
@@ -169,29 +168,6 @@ reinstall_menu() {
     done
 }
 
-offer_setup_reboot() {
-    local status answer
-    run_module reinstall --pending
-    status=$?
-    case "$status" in
-        0)
-            log WARN 'Reinstallation is pending. Rebooting will erase the target disk and start installation.'
-            log INFO 'Review the reinstallation output, or open Reinstall OS and select 99 to cancel before rebooting.'
-            return 0
-            ;;
-        1) ;;
-        *) log ERROR 'Cannot check pending reinstallation; skipping the setup reboot prompt.'; return 1 ;;
-    esac
-    printf '\n'
-    read -r -n 1 -p 'Reboot system now to apply all changes? (y/N): ' answer || return 0
-    printf '\n'
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-        log INFO 'Rebooting in 5 seconds... (Ctrl+C to cancel)'
-        sleep 5
-        reboot
-    fi
-}
-
 dispatch_choice() {
     case "$1" in
         01) run_module debian sources ;;
@@ -204,10 +180,6 @@ dispatch_choice() {
         08) run_module debian go ;;
         09) reinstall_menu ;;
         reset) run_module debian reset-init ;;
-        99)
-            if ! run_module debian all; then return 1; fi
-            offer_setup_reboot
-            ;;
         *) log ERROR 'Invalid option. Select a listed number.'; return 1 ;;
     esac
 }
@@ -242,7 +214,7 @@ main() {
     while true; do
         show_menu
         printf '\n'
-        if ! read -r -p 'Select option [00-99]: ' choice; then
+        if ! read -r -p 'Select option [00-09]: ' choice; then
             entry_error 'Interactive input is unavailable. Download the project or use the documented bash -c command.'
             return 1
         fi

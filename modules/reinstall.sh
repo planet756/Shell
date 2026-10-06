@@ -30,7 +30,7 @@ WINDOWS_SHA256='a0334f31ea7a3e6932b9ad7206608248f0bd40698bfb8fc65f14fc5e4976c160
 DRY_RUN=no DISK='' DISK_PTUUID='' DISK_BYTES='' BOOT_MODE=''
 NETWORK_MODE=auto NIC='' MAC='' ADDRESS='' GATEWAY='' DNS='' NETMASK=''
 HOSTNAME_VALUE='reinstall' SSH_PORT=22 RDP_PORT=3389 SSH_KEY_FILE='' ISO_URL=''
-CUSTOM_ISO_SHA256='' ISO_SOURCE=ntriver
+CUSTOM_ISO_SHA256='' ISO_SOURCE=ntriver WINDOWS_ISO_OPTION=no
 PASSWORD_HASH='' WINDOWS_PASSWORD='' VIRTIO=no WORK_DIR='' PREPARING=no
 GRUB_CONFIG='' GRUB_ENV='' GRUB_MKCONFIG='' GRUB_REBOOT='' GRUB_EDITENV='' GRUB_PROBE=''
 
@@ -50,7 +50,7 @@ Usage:
   bash debiankit.sh reinstall --dry-run PRESET        Preview without system changes
 
 Options:
-  --lang CODE                 System language; default en-us, interactive when omitted
+  --lang CODE                 Default en-us; other languages require a custom --url
   --disk /dev/sda             Explicit target disk (default: current root disk)
   --network auto|dhcp|static  Default: infer from the active IPv4 interface
   --address IPv4/PREFIX       Static address (default: current address)
@@ -60,9 +60,13 @@ Options:
   --ssh-port PORT             Debian SSH / Windows installation environment
   --ssh-key FILE              Optional local OpenSSH public key file
   --rdp-port PORT             Windows RDP port, default 3389
-  --iso HTTPS_URL             Custom ISO URL; --url is an alias
+  --url HTTPS_URL             Debian installer directory or Windows ISO URL
+  --iso HTTPS_URL             Windows ISO URL; alias of --url for Windows
   --iso-sha256 HASH           Custom ISO SHA-256 (default: original en-US IoT ISO hash)
 
+Built-in sources only install English (United States), without a language prompt.
+Custom sources allow English or Simplified Chinese; select with --lang or the menu.
+Debian --url must contain SHA256SUMS and netboot/debian-installer/amd64 files.
 Windows automatically downloads the original en-US IoT ISO from NTriver.
 Other Windows languages require a matching custom IoT ISO URL and SHA-256.
 The previous preset name windows10-ltsc remains an alias for windows10-iot-ltsc.
@@ -70,7 +74,7 @@ The previous preset name windows10-ltsc remains an alias for windows10-iot-ltsc.
 Run on an x86_64 Linux server with GRUB and BIOS or UEFI (Secure Boot off).
 Debian uses its official network installer. Windows uses an Alpine RAM
 environment, original Microsoft ISO, and Fedora VirtIO drivers when needed.
-Passwords are requested interactively and are never printed.
+Passwords are requested interactively; Enter generates a password shown once on the terminal.
 Preparation changes the boot configuration. Reboot manually to install.
 Installation erases every partition on the selected disk.
 EOF
@@ -91,6 +95,9 @@ select_preset() {
         IFS='|' read -r id LABEL INSTALLER RELEASE default_language <<< "$row"
         if [[ "$id" == "$requested" ]]; then
             TARGET="$id"
+            if [[ "$INSTALLER" == debian && ( "$WINDOWS_ISO_OPTION" == yes || -n "$CUSTOM_ISO_SHA256" ) ]]; then
+                fail 'Debian needs a network installer directory via --url; --iso and --iso-sha256 are Windows-only.'
+            fi
             apply_language "${REQUESTED_LANGUAGE:-$default_language}"
             return
         fi
@@ -103,7 +110,7 @@ list_languages() {
     for row in "${OS_LANGUAGES[@]}"; do
         IFS='|' read -r id label locale keymap language input filename checksum <<< "$row"
         note=''
-        [[ -n "$filename" ]] || note=' (Windows: custom IoT ISO + SHA-256 required)'
+        [[ "$id" == en-us ]] || note=' (custom --url required; Windows also needs --iso-sha256)'
         printf '  %-8s %s%s\n' "$id" "$label" "$note"
     done
 }
@@ -113,6 +120,7 @@ apply_language() {
     for row in "${OS_LANGUAGES[@]}"; do
         IFS='|' read -r id label locale keymap language input filename checksum <<< "$row"
         [[ "$id" == "$requested" ]] || continue
+        [[ "$id" == en-us || -n "$ISO_URL" ]] || fail 'Other languages require your own source: --url HTTPS_URL.'
         LANGUAGE_LABEL="$label"
         DEBIAN_LOCALE="$locale"; KEYMAP="$keymap"
         LANGUAGE="$language"; INPUT_LOCALE="$input"
@@ -132,6 +140,10 @@ apply_language() {
 
 choose_language() {
     [[ -z "$REQUESTED_LANGUAGE" ]] || return 0
+    if [[ -z "$ISO_URL" || ( "$INSTALLER" == windows && -z "$CUSTOM_ISO_SHA256" ) ]]; then
+        apply_language en-us
+        return 0
+    fi
     local row id label locale keymap language input filename checksum choice index=1
     printf '\nSelect system language (default: English, United States):\n'
     for row in "${OS_LANGUAGES[@]}"; do
@@ -215,7 +227,8 @@ parse_args() {
                     --ssh-port) SSH_PORT="$value" ;;
                     --ssh-key) SSH_KEY_FILE="$value" ;;
                     --rdp-port) RDP_PORT="$value" ;;
-                    --iso|--url) ISO_URL="$value"; ISO_SOURCE=custom ;;
+                    --iso) ISO_URL="$value"; ISO_SOURCE=custom; WINDOWS_ISO_OPTION=yes ;;
+                    --url) ISO_URL="$value"; ISO_SOURCE=custom ;;
                     --iso-sha256) CUSTOM_ISO_SHA256="$value" ;;
                     --lang) REQUESTED_LANGUAGE="$value" ;;
                 esac
@@ -253,6 +266,7 @@ preview() {
         printf 'ISO file: %s\n' "$WINDOWS_FILENAME"
         printf 'Stages: Alpine RAM environment -> original Windows Setup -> Windows.\n'
     else
+        [[ -z "$ISO_URL" ]] || printf 'Installer source: custom HTTPS directory (hidden)\n'
         printf 'Stages: Debian %s network installer -> Debian.\n' "$RELEASE"
     fi
     printf 'Preparation: download OS files, generate local install configuration, set one-shot GRUB entry.\n'
@@ -396,22 +410,34 @@ PY
 }
 
 read_password() {
-    local password confirmation
-    read -r -s -p 'New root / Administrator password: ' password; printf '\n'
-    read -r -s -p 'Confirm password: ' confirmation; printf '\n'
-    [[ "$password" == "$confirmation" && ${#password} -ge 12 ]] || fail 'Passwords must match and have at least 12 characters.'
-    [[ "$password" != *[$'\r\n']* ]] || fail 'Password cannot contain line breaks.'
-    if [[ "$INSTALLER" == windows ]]; then
-        local categories=0
-        [[ ! "$password" =~ [a-z] ]] || categories=$((categories + 1))
-        [[ ! "$password" =~ [A-Z] ]] || categories=$((categories + 1))
-        [[ ! "$password" =~ [0-9] ]] || categories=$((categories + 1))
-        [[ ! "$password" =~ [^a-zA-Z0-9] ]] || categories=$((categories + 1))
-        (( categories >= 3 && ${#password} <= 127 )) || fail 'Windows password must use at least 3 of: uppercase, lowercase, digits, symbols; maximum 127 characters.'
+    local password confirmation generated=no
+    read -r -s -p 'New root / Administrator password (Enter = random): ' password || fail 'Password input ended; installation was not prepared.'
+    printf '\n'
+    if [[ -z "$password" ]]; then
+        password=$(python3 - <<'PY'
+import secrets, string
+groups = (string.ascii_lowercase, string.ascii_uppercase, string.digits, '!@#%-_')
+characters = ''.join(groups)
+password = [secrets.choice(group) for group in groups]
+password += [secrets.choice(characters) for _ in range(16)]
+secrets.SystemRandom().shuffle(password)
+print(''.join(password))
+PY
+        ) || fail 'Random password generation failed.'
+        generated=yes
+    else
+        read -r -s -p 'Confirm password: ' confirmation || fail 'Password confirmation ended; installation was not prepared.'
+        printf '\n'
+        [[ "$password" == "$confirmation" ]] || fail 'Passwords must match.'
     fi
+    [[ "$password" != *[$'\r\n']* ]] || fail 'Password cannot contain line breaks.'
     PASSWORD_HASH=$(printf '%s' "$password" | openssl passwd -6 -stdin)
     if [[ "$INSTALLER" == windows ]]; then
         WINDOWS_PASSWORD=$(printf '%s' "$password" | python3 -c 'import sys,base64; print(base64.b64encode((sys.stdin.read()+"AdministratorPassword").encode("utf-16le")).decode())')
+    fi
+    if [[ "$generated" == yes ]]; then
+        # Keep generated credentials on the controlling terminal, out of redirected logs.
+        printf 'Generated login password (save it before reboot): %s\n' "$password" > /dev/tty || fail 'Cannot display the generated password in the current terminal.'
     fi
     unset password confirmation
 }
@@ -585,13 +611,15 @@ EOF
 }
 
 prepare_debian() {
-    local base="$DEBIAN_MIRROR/dists/$RELEASE/main/installer-amd64/current/images" asset digest
-    printf 'Downloading official Debian installer files...\n'
+    local base="${ISO_URL%/}" asset digest
+    [[ -n "$base" ]] || base="$DEBIAN_MIRROR/dists/$RELEASE/main/installer-amd64/current/images"
+    if [[ -n "$ISO_URL" ]]; then printf 'Downloading Debian installer files from your custom source...\n'
+    else printf 'Downloading official Debian installer files...\n'; fi
     download "$base/SHA256SUMS" "$WORK_DIR/SHA256SUMS"
     for asset in linux initrd.gz; do
         download "$base/netboot/debian-installer/amd64/$asset" "$WORK_DIR/$asset"
         digest=$(awk -v name="netboot/debian-installer/amd64/$asset" '$2==name || $2=="./"name {print $1}' "$WORK_DIR/SHA256SUMS")
-        [[ "$digest" =~ ^[a-fA-F0-9]{64}$ ]] || fail 'Debian checksum is missing from its official manifest.'
+        [[ "$digest" =~ ^[a-fA-F0-9]{64}$ ]] || fail 'Debian checksum is missing from the source manifest.'
         check_hash "$WORK_DIR/$asset" "$digest"
     done
     write_debian_payload "$WORK_DIR/overlay"
@@ -1085,7 +1113,7 @@ reset_installation() {
 }
 
 main() {
-    # Read-only status for the entrypoint's setup reboot prompt.
+    # Read-only status for a pending reinstallation.
     if [[ "${1:-}" == --pending ]]; then
         [[ $# -eq 1 ]] || fail 'Pending status does not accept additional options.'
         if [[ -e "$STATE_DIR" || -e "$GRUB_FRAGMENT" ]]; then return 0; fi
