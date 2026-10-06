@@ -21,10 +21,10 @@ sudo bash debiankit.sh
 菜单保留原来的 `01–08`、`99. Install All`、`00. Exit` 和 `reset`，并追加：
 
 ```text
-09. Reinstall
+09. Reinstall OS
 ```
 
-进入 Reinstall 后再选择系统，执行后返回该子菜单，`00` 返回主菜单：
+进入 Reinstall OS 后再选择系统，执行后返回该子菜单，`00` 返回主菜单：
 
 ```text
 01. Debian 13
@@ -54,7 +54,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/planet756/Shell/mai
 
 ## 独立系统重装脚本
 
-重装逻辑位于 `modules/reinstall.sh`，通过统一入口 `debiankit.sh` 的 `09. Reinstall` 子菜单或 `reinstall` 子命令调用。系统检测、安装配置生成、引导配置、重装及取消流程均由本项目实现。目前提供两个预设：
+重装逻辑位于 `modules/reinstall.sh`，通过统一入口 `debiankit.sh` 的 `09. Reinstall OS` 子菜单或 `reinstall` 子命令调用。系统检测、安装配置生成、引导配置、重装及取消流程均由本项目实现。目前提供两个预设：
 
 | 预设 | 系统 | 安装方式 |
 | --- | --- | --- |

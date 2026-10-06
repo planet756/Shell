@@ -164,7 +164,7 @@ choose_language() {
 
 show_menu() {
     local row id label _ choice index
-    printf '\nStandalone Reinstaller\n\n'
+    printf '\nReinstall OS\n\n'
     index=1
     for row in "${OS_PRESETS[@]}"; do
         IFS='|' read -r id label _ <<< "$row"

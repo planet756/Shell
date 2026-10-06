@@ -78,7 +78,7 @@ show_menu() {
         '06. Install Komari Agent (Non-Root)' \
         '07. Install Node.js (Official Binary)' \
         '08. Install Go (Official Binary)' \
-        '09. Reinstall' \
+        '09. Reinstall OS' \
         '' \
         '99. Install All' \
         '00. Exit'
@@ -103,7 +103,7 @@ Debian actions: sources, user, bbr, docker, telegraf, komari, nodejs, go, all,
                 reset-init
 Reinstall presets: debian13, windows10-iot-ltsc
 Run bash debiankit.sh reinstall --help for reinstallation options.
-Menu option 09 opens Reinstall: choose a system, cancel pending installation,
+Menu option 09 opens Reinstall OS: choose a system, cancel pending installation,
 or return to the main menu. Option 99 runs the original setup components.
 EOF
 }
@@ -139,7 +139,7 @@ reinstall_menu() {
     while true; do
         if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb ]]; then clear; fi
         printf '%b\n' "${BLUE}======================================${NC}"
-        printf '%b\n' "${GREEN}              Reinstall${NC}"
+        printf '%b\n' "${GREEN}             Reinstall OS${NC}"
         printf '%b\n' "${BLUE}======================================${NC}"
         for index in "${!presets[@]}"; do
             printf '%02d. %s\n' "$((index + 1))" "${labels[index]}"
@@ -176,7 +176,7 @@ offer_setup_reboot() {
     case "$status" in
         0)
             log WARN 'Reinstallation is pending. Rebooting will erase the target disk and start installation.'
-            log INFO 'Review the reinstallation output, or open Reinstall and select 99 to cancel before rebooting.'
+            log INFO 'Review the reinstallation output, or open Reinstall OS and select 99 to cancel before rebooting.'
             return 0
             ;;
         1) ;;
