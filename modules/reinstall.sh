@@ -12,6 +12,7 @@ readonly STATE_DIR='/var/lib/standalone-reinstall'
 readonly BOOT_DIR='/boot/standalone-reinstall'
 readonly GRUB_FRAGMENT='/etc/grub.d/99_standalone_reinstall'
 readonly ENTRY_ID='standalone-reinstall'
+readonly REBOOT_REQUESTED_STATUS=200
 readonly LOCK_FILE='/run/standalone-reinstall.lock'
 # id|name|Debian locale|Debian keyboard|Windows language|Windows input|ISO|SHA-256
 # Published Microsoft media hashes: https://awuctl.github.io/mvs/
@@ -391,6 +392,23 @@ show_ready() {
     printf '\n  Start installation:\n    sudo reboot\n'
     printf '\n  Cancel before reboot:\n    sudo bash debiankit.sh reinstall reset\n'
     printf '\nWARNING: Starting installation will erase ALL partitions and data on %s.\n' "$DISK"
+}
+
+offer_reboot() {
+    local answer
+    printf '\nReboot now to start installation? [y/N]: '
+    read -r answer || { printf '\nReboot postponed. The pending installation was kept.\n'; return 0; }
+    case "$answer" in
+        y|Y|yes|Yes|YES)
+            printf '\nRebooting to start installation...\n'
+            if reboot; then
+                # Internal status: the entrypoint closes its menus and reports success.
+                return "$REBOOT_REQUESTED_STATUS"
+            fi
+            fail 'Reboot failed. The pending installation was kept; retry with sudo reboot.'
+            ;;
+        *) printf '\nReboot postponed. The pending installation was kept.\n' ;;
+    esac
 }
 
 find_grub() {
@@ -1966,6 +1984,7 @@ main() {
     PREPARING=no
     unset PASSWORD_HASH WINDOWS_PASSWORD
     show_ready
+    offer_reboot
 }
 
 if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then main "$@"; fi

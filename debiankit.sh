@@ -8,6 +8,7 @@
 DEBIANKIT_ROOT=''
 DEBIANKIT_DOWNLOAD_DIR=''
 DEBIANKIT_COMMON_LOADED=no
+DEBIANKIT_REBOOT_REQUESTED=no
 readonly DEBIANKIT_BASE_URL='https://raw.githubusercontent.com/planet756/Shell/main'
 
 entry_error() {
@@ -108,7 +109,7 @@ EOF
 }
 
 run_module() {
-    local name="$1" script
+    local name="$1" script status
     shift
     case "$name" in
         debian|reinstall) script="$DEBIANKIT_ROOT/modules/$name.sh" ;;
@@ -116,7 +117,17 @@ run_module() {
     esac
     [[ -r "$script" ]] || { entry_error 'Project module is missing; restore the complete project.'; return 2; }
     # Separate processes keep module functions, shell options and traps isolated.
-    bash "$script" "$@"
+    if bash "$script" "$@"; then
+        return 0
+    else
+        status=$?
+    fi
+    # Reinstaller status 200 means reboot was accepted; stop showing menus.
+    if [[ "$name" == reinstall && "$status" -eq 200 ]]; then
+        DEBIANKIT_REBOOT_REQUESTED=yes
+        return 0
+    fi
+    return "$status"
 }
 
 reinstall_menu() {
@@ -164,6 +175,7 @@ reinstall_menu() {
         if ! run_module reinstall "$selected"; then
             printf '\n[FAILED] Reinstall action did not complete. See the error above.\n' >&2
         fi
+        [[ "$DEBIANKIT_REBOOT_REQUESTED" != yes ]] || return 0
         pause || return 0
     done
 }
@@ -225,6 +237,7 @@ main() {
         if ! dispatch_choice "$choice"; then
             log WARN 'The selected action did not complete. Review its output before continuing.'
         fi
+        [[ "$DEBIANKIT_REBOOT_REQUESTED" != yes ]] || return 0
         if [[ "$choice" != 09 ]]; then pause || return 0; fi
     done
 }
