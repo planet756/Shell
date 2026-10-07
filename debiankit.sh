@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # DebianKit - Single entrypoint for setup and OS reinstallation.
-# Version: 1.4.0
+# Version: 1.5.0
 # Author: Planet
 # sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/planet756/Shell/main/debiankit.sh)"
 

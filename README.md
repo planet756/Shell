@@ -34,7 +34,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/planet756/Shell/mai
 00. Exit
 ```
 
-软件源更新固定使用 Debian 13 / trixie。主菜单输入 `reset` 可清除基础包初始化标记。
+软件源更新自动匹配 Debian 11（bullseye）、12（bookworm）、13（trixie）；配置正确时只更新索引，需要修正时备份原配置，保留第三方源。主菜单输入 `reset` 可清除基础包初始化标记。
 
 ## 常用命令
 

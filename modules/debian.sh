@@ -72,34 +72,276 @@ initialize_system() {
     fi
 }
 
-# Update Debian sources
-update_debian_sources() {
-    log "INFO" "Updating Debian sources..."
-
-    # Backup original sources.list
-    if [[ -f /etc/apt/sources.list ]]; then
-        cp /etc/apt/sources.list /etc/apt/sources.list.backup
-        log "INFO" "Original sources.list backed up to sources.list.backup"
-    fi
-
-    # Write new sources.list
-    cat > /etc/apt/sources.list << 'EOF'
-# Debian trixie Sources
-deb http://deb.debian.org/debian trixie main non-free-firmware
-deb http://security.debian.org/debian-security trixie-security main non-free-firmware
-deb http://deb.debian.org/debian/ trixie-updates main non-free-firmware
-deb http://deb.debian.org/debian/ trixie-backports main non-free-firmware
-EOF
-
-    # Update package list
-    if apt-get update > /dev/null 2>&1; then
-        log "SUCCESS" "Debian sources updated successfully"
+# Remove Debian archive entries while retaining third-party repositories.
+filter_debian_sources() {
+    awk -v format="${1##*.}" -v origins="${2:-}" -v probe="${3:-no}" '
+    function archive_uri(uri, suites, components) {
+        if (uri ~ /^cdrom:/) return 1
+        if (uri ~ /:\/\/([^\/[:space:]]+\.)?debian\.org([\/:[:space:]]|$)/) return 1
+        return verified[uri]
+    }
+    function archive(uris, suites, components, items, size, k) {
+        size=split(uris, items, /[[:space:]]+/)
+        for (k=1; k<=size; k++) if (archive_uri(items[k], suites, components)) return 1
         return 0
-    else
-        log "ERROR" "Failed to update package lists"
+    }
+    function describe(types, uris, suites, components, architectures, options, urls, n, k) {
+        n=split(uris, urls, /[[:space:]]+/)
+        for (k=1; k<=n; k++) {
+            if (urls[k] != "" && archive_uri(urls[k], suites, components))
+                printf "%s\t%s\t%s\t%s\t%s\t%s\n", types, urls[k], suites, components, architectures, options
+        }
+    }
+    function candidates(uris, suites, components, urls, releases, n, m, u, s) {
+        n=split(uris, urls, /[[:space:]]+/); m=split(suites, releases, /[[:space:]]+/)
+        if (components !~ /(^|[[:space:]])main([[:space:]]|$)/) return
+        for (u=1; u<=n; u++) {
+            if (archive_uri(urls[u], suites, components) || urls[u] !~ /^https?:\/\/.*\/(debian|debian-security)\/?$/) continue
+            for (s=1; s<=m; s++) {
+                if (releases[s] ~ /^(buster|bullseye|bookworm|trixie|stable|oldstable|oldoldstable)(-(security|updates|backports|proposed-updates))?$/) {
+                    printf "%s\t%s\n", urls[u], releases[s]; break
+                }
+            }
+        }
+    }
+    BEGIN {
+        while (origins != "" && (getline uri < origins) > 0) verified[uri]=1
+        if (origins != "") close(origins)
+        RS = format == "sources" ? "" : "\n"; ORS = format == "sources" ? "\n\n" : "\n"
+    }
+    format != "sources" {
+        if ($0 == "# DebianKit official repositories") { changed=1; next }
+        if ($1 == "deb" || $1 == "deb-src") {
+            i=2; options=""; architectures=""
+            if ($i ~ /^\[/) {
+                while (i <= NF) { options=options " " $i; if ($i ~ /\]$/) break; i++ }
+                i++
+                if (match(options, /arch=[^] ]+/)) architectures=substr(options, RSTART+5, RLENGTH-5)
+            }
+            components=""
+            for (j=i+2; j<=NF && $j !~ /^#/; j++) components=components " " $j
+            if (probe == "check") { describe($1, $i, $(i+1), components, architectures, options); next }
+            if (probe == "yes") { candidates($i, $(i+1), components); next }
+            if (archive($i, $(i+1), components)) { changed=1; next }
+        }
+        if (probe == "yes" || probe == "check") next
+        print; next
+    }
+    {
+        count=split($0, lines, "\n"); field=""
+        uris=""; suites=""; components=""; enabled="yes"; types=""; architectures=""; options=""
+        for (i=1; i<=count; i++) {
+            line=lines[i]
+            if (line ~ /^[[:space:]]*#/) continue
+            if (line !~ /^[[:space:]]/) {
+                colon=index(line, ":")
+                field=tolower(substr(line, 1, colon-1)); line=substr(line, colon+1)
+            }
+            if (field == "uris") uris=uris " " line
+            else if (field == "suites") suites=suites " " line
+            else if (field == "components") components=components " " line
+            else if (field == "enabled") { enabled=tolower(line); gsub(/[[:space:]]/, "", enabled) }
+            else if (field == "types") types=types " " line
+            else if (field == "architectures") architectures=architectures " " line
+            else if (field == "trusted") options=options " trusted=" line
+        }
+        if (probe == "check") { if (enabled != "no") describe(types, uris, suites, components, architectures, options); next }
+        if (probe == "yes") { if (enabled != "no") candidates(uris, suites, components); next }
+        if (enabled != "no" && archive(uris, suites, components)) {
+            count=split(uris, urls, /[[:space:]]+/); foreign=0
+            for (i=1; i<=count; i++) if (urls[i] != "" && !archive(urls[i], suites, components)) foreign=1
+            if (foreign) { invalid=1; exit 4 }
+            changed=1; next
+        }
+        print
+    }
+    END { if (invalid) exit 4; if (probe == "no" && !changed) exit 3 }
+    ' "$1"
+}
+
+# Compare repository meaning, across both source formats, without changing files.
+debian_sources_are_current() {
+    local codename="$1" version="$2" origins="$3" metadata native path
+    shift 3
+    native=$(dpkg --print-architecture) || return 1
+    metadata=$(
+        for path in "$@"; do
+            [[ -f "$path" ]] || continue
+            filter_debian_sources "$path" "$origins" check || exit 1
+        done
+    ) || return 1
+    awk -F '\t' -v codename="$codename" -v version="$version" -v native="$native" '
+    NF {
+        uri=$2
+        if (uri !~ /^https?:\/\// || uri !~ /\/(debian|debian-security)\/?$/) invalid=1
+        sub(/^https?:\/\//, "", uri); sub(/\/+$/, "", uri)
+        if ($6 ~ /trusted=[[:space:]]*yes/) invalid=1
+        arch=$5; gsub(/,/, " ", arch)
+        applicable=(arch ~ /^[[:space:]]*$/ || " " arch " " ~ "[[:space:]]" native "[[:space:]]")
+        types_count=split($1, types, /[[:space:]]+/)
+        suites_count=split($3, suites, /[[:space:]]+/)
+        components_count=split($4, components, /[[:space:]]+/)
+        for (s=1; s<=suites_count; s++) {
+            suite=suites[s]; if (suite == "") continue
+            if (suite != codename && suite != codename "-updates" && suite != codename "-security" &&
+                suite != codename "-backports" && suite != codename "-proposed-updates") invalid=1
+            if (suite ~ /-security$/ && uri !~ /\/debian-security$/) invalid=1
+            if (suite !~ /-security$/ && uri !~ /\/debian$/) invalid=1
+            for (c=1; c<=components_count; c++) {
+                component=components[c]; if (component == "") continue
+                if (component != "main" && component != "contrib" && component != "non-free" &&
+                    !(version != "11" && component == "non-free-firmware")) invalid=1
+                for (t=1; t<=types_count; t++) {
+                    type=types[t]; if (type == "") continue
+                    if (type != "deb" && type != "deb-src") invalid=1
+                    if (type == "deb" && !applicable) continue
+                    key=type SUBSEP uri SUBSEP suite SUBSEP component
+                    if (seen[key]++) invalid=1
+                    if (type == "deb" && component == "main") present[suite]=1
+                }
+            }
+        }
+    }
+    END { exit (invalid || !present[codename] || !present[codename "-updates"] || !present[codename "-security"]) }
+    ' <<< "$metadata"
+}
+
+refresh_debian_package_lists() {
+    local output
+    output=$(mktemp "${TMPDIR:-/tmp}/debiankit-apt-update.XXXXXX") || return 1
+    if ! apt-get -o APT::Update::Error-Mode=any update > "$output" 2>&1; then
+        log ERROR "Failed to update package lists. Source files were kept. See $output"
         return 1
     fi
+    rm -f "$output"
+    log SUCCESS 'Package lists updated successfully'
 }
+
+# Select the running Debian release; stage and back up all affected source files.
+update_debian_sources() (
+    local release_info os_id version codename components apt_dir=/etc/apt
+    local transaction='' committed=no path relative temporary='' status index restore_failed=no uri suite
+    local -a changed=() installed=()
+    # shellcheck disable=SC1091 # Read the target systems release metadata.
+    if ! release_info=$(ID=''; VERSION_ID=''; . /etc/os-release && printf '%s|%s' "${ID:-}" "${VERSION_ID:-}"); then
+        log ERROR 'Cannot read the current system version.'
+        return 1
+    fi
+    IFS='|' read -r os_id version <<< "$release_info"
+    [[ "$os_id" == debian ]] || { log ERROR 'Update Debian Sources supports Debian 11, 12 and 13 only.'; return 1; }
+    case "$version" in
+        11) codename=bullseye; components='main contrib non-free' ;;
+        12) codename=bookworm; components='main contrib non-free non-free-firmware' ;;
+        13) codename=trixie; components='main contrib non-free non-free-firmware' ;;
+        *) log ERROR 'Update Debian Sources supports Debian 11, 12 and 13 only.'; return 1 ;;
+    esac
+    log INFO "Updating official sources for Debian $version ($codename)..."
+    transaction=$(mktemp -d "$apt_dir/debiankit-sources-backup.XXXXXX") || return 1
+    mkdir -p "$transaction/new/sources.list.d" "$transaction/backup/sources.list.d" || return 1
+    # shellcheck disable=SC2329 # Invoked by the EXIT trap.
+    rollback_debian_sources() {
+        local result=$?
+        trap - EXIT INT TERM
+        [[ -z "$temporary" ]] || rm -f -- "$temporary"
+        if [[ "$committed" != yes ]]; then
+            for ((index=${#installed[@]}-1; index>=0; index--)); do
+                relative="${installed[index]}"
+                path="$apt_dir/$relative"
+                if [[ -f "$transaction/backup/$relative" ]]; then
+                    temporary=$(mktemp "${path}.debiankit.XXXXXX") || { restore_failed=yes; continue; }
+                    if ! cp -p "$transaction/backup/$relative" "$temporary" || ! mv -f "$temporary" "$path"; then
+                        restore_failed=yes
+                    fi
+                    rm -f -- "$temporary"
+                else
+                    rm -f -- "$path" || restore_failed=yes
+                fi
+            done
+            if [[ "$restore_failed" == yes ]]; then
+                log ERROR "Source rollback could not finish. Restore the backups in $transaction/backup"
+            elif (( ${#installed[@]} > 0 )); then
+                log WARN 'Previous APT source files were restored.'
+            fi
+        fi
+        rm -rf -- "$transaction/new"
+        return "$result"
+    }
+    trap rollback_debian_sources EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # A /debian URL can be a vendor repository. Verify custom mirror provenance first.
+    : > "$transaction/origins" || return 1
+    for path in "$apt_dir/sources.list" "$apt_dir"/sources.list.d/*.list "$apt_dir"/sources.list.d/*.sources; do
+        [[ -f "$path" ]] || continue
+        filter_debian_sources "$path" "$transaction/origins" yes > "$transaction/candidates" || return 1
+        while IFS=$'\t' read -r uri suite; do
+            [[ -n "$uri" ]] || continue
+            if /usr/lib/apt/apt-helper -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 \
+                -o Acquire::ForceIPv4=true -o Acquire::Retries=0 \
+                download-file "${uri%/}/dists/$suite/InRelease" "$transaction/probe-release" > /dev/null 2>&1 &&
+                gpgv --keyring /usr/share/keyrings/debian-archive-keyring.gpg "$transaction/probe-release" > /dev/null 2>&1 &&
+                grep -Fxq 'Origin: Debian' "$transaction/probe-release"; then
+                printf '%s\n' "$uri" >> "$transaction/origins" || return 1
+            fi
+            rm -f "$transaction/probe-release" || return 1
+        done < "$transaction/candidates"
+    done
+    if debian_sources_are_current "$codename" "$version" "$transaction/origins" \
+        "$apt_dir/sources.list" "$apt_dir"/sources.list.d/*.list "$apt_dir"/sources.list.d/*.sources; then
+        committed=yes
+        rm -rf -- "$transaction" || return 1
+        log INFO "Official sources already match Debian $version ($codename). Keeping the existing configuration."
+        refresh_debian_package_lists
+        return $?
+    fi
+    for path in "$apt_dir/sources.list" "$apt_dir"/sources.list.d/*.list "$apt_dir"/sources.list.d/*.sources; do
+        relative="${path#"$apt_dir/"}"
+        if [[ -e "$path" || -L "$path" ]]; then
+            [[ -f "$path" ]] || { log ERROR 'APT source paths must be regular files.'; return 1; }
+            if filter_debian_sources "$path" "$transaction/origins" > "$transaction/new/$relative"; then
+                status=0
+            else
+                status=$?
+                if [[ "$status" == 4 ]]; then
+                    log ERROR "A source stanza mixes Debian and third-party URLs. Split it before updating: $path"
+                    return 1
+                fi
+                [[ "$status" == 3 ]] || { log ERROR 'Cannot read the existing APT sources.'; return 1; }
+            fi
+            if [[ "$relative" != sources.list && "$status" == 3 ]]; then continue; fi
+            [[ ! -L "$path" ]] || { log ERROR "Cannot replace a source file symlink: $path"; return 1; }
+            cp -p "$path" "$transaction/backup/$relative" || return 1
+        elif [[ "$relative" != sources.list ]]; then continue; fi
+        changed+=("$relative")
+    done
+    if ! cat >> "$transaction/new/sources.list" <<EOF
+# DebianKit official repositories
+deb http://deb.debian.org/debian $codename $components
+deb http://deb.debian.org/debian $codename-updates $components
+deb http://security.debian.org/debian-security $codename-security $components
+EOF
+    then return 1; fi
+    for relative in "${changed[@]}"; do
+        path="$apt_dir/$relative"
+        temporary=$(mktemp "${path}.debiankit.XXXXXX") || return 1
+        if [[ -f "$transaction/backup/$relative" ]]; then
+            cp -p "$transaction/backup/$relative" "$temporary" || return 1
+            cat "$transaction/new/$relative" > "$temporary" || return 1
+        else
+            install -m 0644 "$transaction/new/$relative" "$temporary" || return 1
+        fi
+        installed+=("$relative")
+        mv -f "$temporary" "$path" || return 1
+        temporary=''
+    done
+    log INFO "Original source files backed up to $transaction/backup"
+    if ! apt-get -o APT::Update::Error-Mode=any update > "$transaction/apt-update.log" 2>&1; then
+        log ERROR "Failed to update package lists. See $transaction/apt-update.log"
+        return 1
+    fi
+    committed=yes
+    log SUCCESS "Debian $version ($codename) official sources updated successfully"
+)
 
 # Initialize user
 init_user() {
@@ -1746,6 +1988,11 @@ debian_main() {
             return 1
         fi
         return 0
+    fi
+    # Repair sources before any package initialization uses the old repositories.
+    if [[ "$action" == sources ]]; then
+        "$handler"
+        return $?
     fi
     initialize_system
     "$handler"
